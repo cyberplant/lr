@@ -179,6 +179,7 @@ pub fn tail_reader_with_initial(
 
         // Read any new bytes.
         if size > pos {
+            let mut new_lines = 0u64;
             loop {
                 let n = file.read(&mut buf)?;
                 if n == 0 {
@@ -196,7 +197,14 @@ pub fn tail_reader_with_initial(
                         tracing::debug!("tail: channel closed, exiting");
                         return Ok(());
                     }
+                    new_lines += 1;
                 }
+            }
+            // Update the estimated total line count for appended lines.
+            if new_lines > 0
+                && let Some(ref progress) = progress
+            {
+                progress.increment_total_lines(new_lines);
             }
         }
 

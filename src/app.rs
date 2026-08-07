@@ -415,16 +415,34 @@ fn run_tui_loop(
 
         // Poll for input with a short timeout.
         if event::poll(Duration::from_millis(50))? {
-            let ev = event::read()?;
-            if let Event::Key(key) = ev {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            // Drain all pending key events before rendering — coalesces
+            // rapid key presses (e.g. 4x page-down) into a single render.
+            loop {
+                let ev = event::read()?;
+                if let Event::Key(key) = ev {
+                    if key.kind != KeyEventKind::Press {
+                        // Check if there are more events before breaking.
+                        if !event::poll(Duration::from_millis(0))? {
+                            break;
+                        }
+                        continue;
+                    }
+                    match map_event(key) {
+                        AppAction::Quit => {
+                            state.quit_requested = true;
+                            break;
+                        }
+                        AppAction::Noop => {}
+                        other => state.apply(other),
+                    }
                 }
-                match map_event(key) {
-                    AppAction::Quit => break,
-                    AppAction::Noop => {}
-                    other => state.apply(other),
+                // Non-blocking check: are there more events queued?
+                if !event::poll(Duration::from_millis(0))? {
+                    break;
                 }
+            }
+            if state.quit_requested {
+                break;
             }
         }
     }

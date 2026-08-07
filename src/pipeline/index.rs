@@ -129,6 +129,12 @@ impl ReadProgress {
         self.inner.lines_estimated.store(true, Ordering::Relaxed);
     }
 
+    /// Increment the estimated total by n (new appended lines).
+    /// Called by the tail reader's follow loop.
+    pub fn increment_total_lines(&self, n: u64) {
+        self.inner.estimated_total_lines.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Mark the line count as exact (no longer estimated). Called when the
     /// head reader has scanned the entire file and we know the real count.
     pub fn set_lines_exact(&self) {
