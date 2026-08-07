@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::config::Config;
+use crate::pipeline::index::ReadProgress;
 use crate::pipeline::parser::ParsedLine;
 use crate::plugin::Severity;
 use crate::theme::Theme;
@@ -37,6 +38,9 @@ pub struct AppState {
 
     pub stats: Stats,
     pub message: String,
+
+    /// Read progress tracker (shared with head/tail readers).
+    pub progress: ReadProgress,
 
     /// Last known terminal height (updated by the renderer each frame).
     pub terminal_height: u16,
@@ -92,8 +96,14 @@ impl AppState {
             severity_visible: SeverityVisibility::all_on(),
             stats: Stats::default(),
             message,
+            progress: ReadProgress::new(0),
             terminal_height: 24,
         }
+    }
+
+    /// Set the read progress tracker.
+    pub fn set_progress(&mut self, progress: ReadProgress) {
+        self.progress = progress;
     }
 
     /// Push a new parsed line and update stats.

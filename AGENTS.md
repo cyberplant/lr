@@ -51,6 +51,28 @@ Key commands: `open`, `readfile full|quick|x%`, `show`, `goto`, `stats`,
 - `quick` — first lines available + tail at EOF
 - `50%` — 50% of file by bytes read
 
+## Dual-reader architecture
+
+Both head and tail readers start simultaneously for every file:
+
+- **Head reader**: reads from byte 0 forward to `tail_start` (= `max(0, EOF - 64KB)`).
+  Provides the HOME view. Stops at `tail_start` to avoid duplicating tail lines.
+- **Tail reader**: seeks to `tail_start`, reads forward to EOF (initial screenful),
+  then follows appends. Provides the END/follow view. Shows the last ~500 lines
+  immediately without reading the whole file.
+
+Lines from both readers are merged by sorting on `byte_offset` and renumbered
+sequentially. This gives correct file order regardless of which reader finishes
+first.
+
+**Line count estimation**: The tail reader computes an estimated total line
+count from the average line size in its 64KB chunk (`file_size / avg_line_size`).
+Shown as `~N (est!)` in yellow in the status bar until the head reader finishes
+and provides the exact count.
+
+**Status bar**: shows FOLLOW indicator, line count (with est! if estimated),
+lines/sec, severity flags (EWIDT), file position percentage, and scroll position.
+
 ## Default mode
 
 lr starts in **head mode** (showing the beginning of the file). Use `-f` or

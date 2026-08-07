@@ -26,6 +26,12 @@ struct ReadProgressInner {
     line_count: AtomicU64,
     /// Whether the head reader has finished (reached initial EOF).
     head_done: std::sync::atomic::AtomicBool,
+    /// Estimated total line count, computed from the tail's 64KB chunk.
+    /// 0 means not yet computed.
+    estimated_total_lines: AtomicU64,
+    /// Whether the line count is estimated (true) or exact (false).
+    /// Estimated until the head reader reaches the tail's start offset.
+    lines_estimated: std::sync::atomic::AtomicBool,
 }
 
 impl ReadProgress {
@@ -36,6 +42,8 @@ impl ReadProgress {
                 file_size: AtomicU64::new(file_size),
                 line_count: AtomicU64::new(0),
                 head_done: std::sync::atomic::AtomicBool::new(false),
+                estimated_total_lines: AtomicU64::new(0),
+                lines_estimated: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -95,6 +103,31 @@ impl ReadProgress {
         self.inner.file_size.store(size, Ordering::Relaxed);
         self.inner.line_count.store(0, Ordering::Relaxed);
         self.inner.head_done.store(false, Ordering::Relaxed);
+        self.inner.estimated_total_lines.store(0, Ordering::Relaxed);
+        self.inner.lines_estimated.store(false, Ordering::Relaxed);
+    }
+
+    /// Set the estimated total line count, computed from the tail's 64KB chunk.
+    /// Called by the tail reader after its initial backward read.
+    pub fn set_estimated_total_lines(&self, estimated: u64) {
+        self.inner.estimated_total_lines.store(estimated, Ordering::Relaxed);
+        self.inner.lines_estimated.store(true, Ordering::Relaxed);
+    }
+
+    /// Mark the line count as exact (no longer estimated). Called when the
+    /// head reader has scanned the entire file and we know the real count.
+    pub fn set_lines_exact(&self) {
+        self.inner.lines_estimated.store(false, Ordering::Relaxed);
+    }
+
+    /// The estimated total line count (0 if not yet computed).
+    pub fn estimated_total_lines(&self) -> u64 {
+        self.inner.estimated_total_lines.load(Ordering::Relaxed)
+    }
+
+    /// Whether the line count is currently estimated (not yet exact).
+    pub fn lines_estimated(&self) -> bool {
+        self.inner.lines_estimated.load(Ordering::Relaxed)
     }
 }
 

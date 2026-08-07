@@ -11,7 +11,7 @@ use crate::app::events::AppAction;
 use crate::app::state::AppState;
 use crate::io::file::open_dual;
 use crate::io::reader::head_reader;
-use crate::io::tail::tail_reader;
+use crate::io::tail::tail_reader_with_initial;
 use crate::io::RawLine;
 use crate::pipeline::index::ReadProgress;
 use crate::plugin::Severity;
@@ -77,6 +77,7 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
                 Ok(dual) => {
                     let source = path.to_string_lossy().to_string();
                     let size = dual.size;
+                    let tail_start = dual.tail_start;
                     // Update the progress tracker for this new file.
                     repl.progress.update_file_size(size);
                     let tx = repl.raw_tx.clone();
@@ -84,7 +85,7 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
                     let head_file = dual.head;
                     let p = repl.progress.clone();
                     tokio::task::spawn_blocking(move || {
-                        if let Err(e) = head_reader(head_file, size, src, tx, p) {
+                        if let Err(e) = head_reader(head_file, tail_start, src, tx, p) {
                             tracing::error!("head reader: {e:#}");
                         }
                     });
@@ -92,8 +93,17 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
                     let src = source.clone();
                     let tail_file = dual.tail;
                     let tail_path = path.clone();
+                    let p = repl.progress.clone();
                     tokio::task::spawn_blocking(move || {
-                        if let Err(e) = tail_reader(tail_file, size, tail_path, src, tx) {
+                        if let Err(e) = tail_reader_with_initial(
+                            tail_file,
+                            size,
+                            tail_path,
+                            src,
+                            tx,
+                            crate::io::file::TAIL_INITIAL_READ,
+                            Some(p),
+                        ) {
                             tracing::error!("tail reader: {e:#}");
                         }
                     });
@@ -227,13 +237,14 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
                 Ok(dual) => {
                     let source = p_path.to_string_lossy().to_string();
                     let size = dual.size;
+                    let tail_start = dual.tail_start;
                     repl.progress.update_file_size(size);
                     let tx = repl.raw_tx.clone();
                     let src = source.clone();
                     let head_file = dual.head;
                     let p = repl.progress.clone();
                     tokio::task::spawn_blocking(move || {
-                        if let Err(e) = head_reader(head_file, size, src, tx, p) {
+                        if let Err(e) = head_reader(head_file, tail_start, src, tx, p) {
                             tracing::error!("head reader: {e:#}");
                         }
                     });
@@ -241,8 +252,17 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
                     let src = source.clone();
                     let tail_file = dual.tail;
                     let tail_path = p_path.clone();
+                    let p = repl.progress.clone();
                     tokio::task::spawn_blocking(move || {
-                        if let Err(e) = tail_reader(tail_file, size, tail_path, src, tx) {
+                        if let Err(e) = tail_reader_with_initial(
+                            tail_file,
+                            size,
+                            tail_path,
+                            src,
+                            tx,
+                            crate::io::file::TAIL_INITIAL_READ,
+                            Some(p),
+                        ) {
                             tracing::error!("tail reader: {e:#}");
                         }
                     });
@@ -647,8 +667,8 @@ fn render_fields(state: &AppState, line: u64) -> DispatchResult {
                 let v = &pl.fields[k];
                 out.push_str(&format!("  {} = {}\n", k, field_value_display(v)));
             }
-            if pl.timestamp_ns.is_some() {
-                out.push_str(&format!("  _ts = {} ns\n", pl.timestamp_ns.unwrap()));
+            if let Some(ts) = pl.timestamp_ns {
+                out.push_str(&format!("  _ts = {} ns\n", ts));
             }
             if let Some(sev) = pl.severity {
                 out.push_str(&format!("  _severity = {:?}\n", sev));

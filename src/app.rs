@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::io::file::open_dual;
 use crate::io::reader::head_reader;
 use crate::io::stdin::stdin_reader;
-use crate::io::tail::tail_reader;
+use crate::io::tail::tail_reader_with_initial;
 use crate::io::RawLine;
 use crate::pipeline::index::ReadProgress;
 use crate::pipeline::parser::{ParsedLine, Parser};
@@ -66,8 +66,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         .map(|m| m.len())
         .unwrap_or(0);
     let progress = ReadProgress::new(file_size);
+    state.set_progress(progress.clone());
 
-    spawn_sources(&cli, raw_tx.clone(), progress.clone());
+    spawn_sources(&cli, raw_tx.clone(), progress.clone(), follow);
     spawn_parser(raw_rx, parsed_tx);
 
     if cli.should_use_repl_mode() {
@@ -97,13 +98,23 @@ async fn run_repl(
             let mut lines_this_sec: u64 = 0;
             let mut sec_start = Instant::now();
             loop {
+                let mut new_lines = 0u64;
                 while let Ok(line) = parsed_rx.try_recv() {
                     let mut s = state.lock().await;
                     s.push_line(line);
+                    new_lines += 1;
+                }
+                if new_lines > 0 {
+                    lines_this_sec += new_lines;
+                    // Sort by byte offset to merge head and tail output.
+                    let mut s = state.lock().await;
+                    s.lines.sort_by_key(|l| l.byte_offset);
+                    for (i, line) in s.lines.iter_mut().enumerate() {
+                        line.line_no = (i + 1) as u64;
+                    }
                     if s.follow {
                         s.scroll_to_bottom();
                     }
-                    lines_this_sec += 1;
                 }
                 if sec_start.elapsed() >= Duration::from_secs(1) {
                     let mut s = state.lock().await;
@@ -156,8 +167,18 @@ async fn run_repl(
     Ok(())
 }
 
-/// Spawn head and tail readers for each file, or a stdin reader.
-fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>, progress: ReadProgress) {
+/// Spawn readers for each file, or stdin.
+///
+/// Both head and tail readers always start simultaneously:
+/// - Head reader: reads from byte 0 to `tail_start` (stops before the tail's
+///   initial read region to avoid duplicates).
+/// - Tail reader: seeks to `EOF - 64KB`, reads forward to EOF (initial
+///   screenful), then follows appends.
+///
+/// This means HOME shows the beginning immediately, END shows the last
+/// lines immediately, and both work in parallel. When the head reader
+/// reaches `tail_start`, the two views merge seamlessly.
+fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>, progress: ReadProgress, _follow: bool) {
     if cli.files().is_empty() && !cli.stdin() {
         return;
     }
@@ -181,9 +202,9 @@ fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>, progress: ReadProgres
         };
         let source = path.to_string_lossy().to_string();
         let size = dual.size;
+        let tail_start = dual.tail_start;
 
-        // Head reader: reads from byte 0 to initial EOF.
-        // Only the first file's progress is tracked (primary file).
+        // Head reader: reads from byte 0 to tail_start (stops before tail's region).
         let tx_head = raw_tx.clone();
         let src_head = source.clone();
         let head_file = dual.head;
@@ -193,18 +214,32 @@ fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>, progress: ReadProgres
             ReadProgress::new(size)
         };
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = head_reader(head_file, size, src_head, tx_head, head_progress) {
+            if let Err(e) = head_reader(head_file, tail_start, src_head, tx_head, head_progress) {
                 tracing::error!("head reader: {e:#}");
             }
         });
 
-        // Tail reader: follows appends from initial EOF onward.
+        // Tail reader: initial backward read from (EOF - 64KB) to EOF,
+        // then follows appends. Always runs.
         let tx_tail = raw_tx.clone();
         let src_tail = source.clone();
         let tail_file = dual.tail;
         let tail_path = path.clone();
+        let tail_progress = if i == 0 {
+            Some(progress.clone())
+        } else {
+            None
+        };
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = tail_reader(tail_file, size, tail_path, src_tail, tx_tail) {
+            if let Err(e) = tail_reader_with_initial(
+                tail_file,
+                size,
+                tail_path,
+                src_tail,
+                tx_tail,
+                crate::io::file::TAIL_INITIAL_READ,
+                tail_progress,
+            ) {
                 tracing::error!("tail reader: {e:#}");
             }
         });
@@ -251,6 +286,14 @@ fn run_tui_loop(
         }
         if new_lines > 0 {
             lines_this_sec += new_lines;
+            // Sort lines by byte offset to merge head and tail reader output.
+            // Both readers send lines roughly in byte-offset order, but
+            // interleaved. Sorting gives the correct file order.
+            state.lines.sort_by_key(|l| l.byte_offset);
+            // Renumber lines sequentially after sorting.
+            for (i, line) in state.lines.iter_mut().enumerate() {
+                line.line_no = (i + 1) as u64;
+            }
             // If following, snap to the bottom.
             if state.follow {
                 state.scroll_to_bottom();

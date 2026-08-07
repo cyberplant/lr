@@ -121,6 +121,22 @@ fn render_line(pl: &crate::pipeline::parser::ParsedLine, _width: usize) -> Line<
 
 fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
     let follow_indicator = if state.follow { "FOLLOW" } else { "  --  " };
+
+    // File position as percentage.
+    let file_pct = state.progress.fraction() * 100.0;
+    let file_pos = format!("{:.0}%", file_pct);
+
+    // Line count display: show estimated count with "(est!)" if estimated,
+    // or actual count if exact.
+    let (line_count_str, line_count_color) = if state.progress.lines_estimated() {
+        (
+            format!("~{} (est!)", state.progress.estimated_total_lines()),
+            Color::Yellow,
+        )
+    } else {
+        (format!("{}", state.stats.total_lines), Color::Yellow)
+    };
+
     let pos = if state.lines.is_empty() {
         "0/0".to_string()
     } else {
@@ -145,10 +161,7 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(
-            format!("{} lines", state.stats.total_lines),
-            Style::default().fg(Color::Yellow),
-        ),
+        Span::styled(line_count_str, Style::default().fg(line_count_color)),
         Span::raw("  |  "),
         Span::styled(
             format!("{:.0} L/s", state.stats.lines_per_sec),
@@ -156,6 +169,8 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
         ),
         Span::raw("  |  "),
         Span::styled(sev_flags, Style::default().fg(Color::White)),
+        Span::raw("  |  "),
+        Span::styled(file_pos, Style::default().fg(Color::Magenta)),
         Span::raw("  |  "),
         Span::styled(pos, Style::default().fg(Color::White)),
     ]);
