@@ -64,7 +64,7 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
     let visible_height = state.visible_height();
     let scroll = state.scroll.min(state.max_scroll());
 
-    // Build visible lines, filtering by severity visibility.
+    // Build visible lines, filtering by severity visibility and filter expr.
     let mut lines_rendered: Vec<Line> = Vec::with_capacity(visible_height);
     let mut idx = scroll;
     while lines_rendered.len() < visible_height && idx < state.lines.len() {
@@ -78,7 +78,12 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
             continue;
         }
 
-        lines_rendered.push(render_line(pl, area.width as usize, state.show_line_numbers));
+        // Skip lines that don't match the active filter.
+        if !state.passes_filter(pl) {
+            continue;
+        }
+
+        lines_rendered.push(render_line(pl, area.width as usize, state.show_line_numbers, state));
     }
 
     // If we filtered out lines and haven't filled the view, keep going.
@@ -90,7 +95,10 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
         {
             continue;
         }
-        lines_rendered.push(render_line(pl, area.width as usize, state.show_line_numbers));
+        if !state.passes_filter(pl) {
+            continue;
+        }
+        lines_rendered.push(render_line(pl, area.width as usize, state.show_line_numbers, state));
     }
 
     let block = Block::default().borders(Borders::ALL).title(title);
@@ -98,7 +106,12 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
     frame.render_widget(paragraph, area);
 }
 
-fn render_line(pl: &crate::pipeline::parser::ParsedLine, _width: usize, show_line_no: bool) -> Line<'static> {
+fn render_line(
+    pl: &crate::pipeline::parser::ParsedLine,
+    _width: usize,
+    show_line_no: bool,
+    state: &AppState,
+) -> Line<'static> {
     let color = match pl.severity {
         Some(Severity::Error) => Color::Red,
         Some(Severity::Warn) => Color::Yellow,
@@ -108,17 +121,54 @@ fn render_line(pl: &crate::pipeline::parser::ParsedLine, _width: usize, show_lin
         None => Color::Reset,
     };
 
-    if show_line_no {
-        Line::from(vec![
-            Span::styled(format!("{:>6} ", pl.line_no), Style::default().fg(Color::DarkGray)),
-            Span::styled(pl.raw.clone(), Style::default().fg(color)),
-        ])
+    // Build the text spans, highlighting search matches if active.
+    let text_spans = if let Some(ref search) = state.search {
+        highlight_matches(&pl.raw, search, color)
     } else {
-        Line::from(vec![Span::styled(
-            pl.raw.clone(),
-            Style::default().fg(color),
-        )])
+        vec![Span::styled(pl.raw.clone(), Style::default().fg(color))]
+    };
+
+    if show_line_no {
+        let mut spans = vec![Span::styled(
+            format!("{:>6} ", pl.line_no),
+            Style::default().fg(Color::DarkGray),
+        )];
+        spans.extend(text_spans);
+        Line::from(spans)
+    } else {
+        Line::from(text_spans)
     }
+}
+
+/// Split text into spans, highlighting regex matches in black-on-yellow.
+fn highlight_matches(text: &str, search: &crate::search::Search, base_color: Color) -> Vec<Span<'static>> {
+    let matches = search.find_iter(text);
+    if matches.is_empty() {
+        return vec![Span::styled(text.to_string(), Style::default().fg(base_color))];
+    }
+
+    let mut spans = Vec::with_capacity(matches.len() * 2 + 1);
+    let mut last_end = 0;
+    for (start, end) in matches {
+        if start > last_end {
+            spans.push(Span::styled(
+                text[last_end..start].to_string(),
+                Style::default().fg(base_color),
+            ));
+        }
+        spans.push(Span::styled(
+            text[start..end].to_string(),
+            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+        last_end = end;
+    }
+    if last_end < text.len() {
+        spans.push(Span::styled(
+            text[last_end..].to_string(),
+            Style::default().fg(base_color),
+        ));
+    }
+    spans
 }
 
 fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
@@ -179,16 +229,58 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
         Span::styled(processing_str, Style::default().fg(Color::Magenta)),
         Span::raw("  |  "),
         Span::styled(pos_str, Style::default().fg(pos_color)),
+        // Show search match count if a search is active.
+        if !state.search_matches.is_empty() {
+            Span::raw("  |  ")
+        } else {
+            Span::raw("")
+        },
+        if !state.search_matches.is_empty() {
+            Span::styled(
+                format!("match {}/{}", state.search_cursor + 1, state.search_matches.len()),
+                Style::default().fg(Color::Yellow),
+            )
+        } else {
+            Span::raw("")
+        },
     ]);
 
     let bar = Paragraph::new(line).style(Style::default().bg(Color::Blue));
     frame.render_widget(bar, area);
 }
 
-fn render_command_bar(frame: &mut Frame, _state: &AppState, area: ratatui::layout::Rect) {
-    let hint = Line::from(Span::styled(
-        " : command  / search  f follow  l line#  HOME/END  1-5 severity  ? help  q quit",
-        Style::default().fg(Color::DarkGray),
-    ));
-    frame.render_widget(Paragraph::new(hint), area);
+fn render_command_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
+    use crate::app::state::InputMode;
+
+    let line = match state.input_mode {
+        InputMode::Normal => {
+            // Show hint line or message.
+            if !state.message.is_empty() {
+                Line::from(Span::styled(
+                    format!(" {}", state.message),
+                    Style::default().fg(Color::Yellow),
+                ))
+            } else {
+                Line::from(Span::styled(
+                    " : command  / search  f follow  l line#  HOME/END  1-5 severity  n/N match  Esc clear  ? help  q quit",
+                    Style::default().fg(Color::DarkGray),
+                ))
+            }
+        }
+        InputMode::Search => {
+            Line::from(vec![
+                Span::styled("/", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(state.input_buffer.as_str(), Style::default().fg(Color::White)),
+                Span::styled("_", Style::default().fg(Color::Gray).add_modifier(Modifier::SLOW_BLINK)),
+            ])
+        }
+        InputMode::Command => {
+            Line::from(vec![
+                Span::styled(":", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(state.input_buffer.as_str(), Style::default().fg(Color::White)),
+                Span::styled("_", Style::default().fg(Color::Gray).add_modifier(Modifier::SLOW_BLINK)),
+            ])
+        }
+    };
+    frame.render_widget(Paragraph::new(line), area);
 }

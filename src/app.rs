@@ -27,11 +27,12 @@ use crate::pipeline::index::ReadProgress;
 use crate::pipeline::parser::{ParsedLine, Parser};
 use crate::repl::dispatcher::OutputFormat;
 use crate::theme::Theme;
+use crate::app::events::{map_event, map_input_event, AppAction, InputAction};
+use crate::app::state::InputMode;
 
 pub mod events;
 pub mod state;
 
-use events::{map_event, AppAction};
 use state::AppState;
 
 /// Channel capacity for raw lines (reader → parser) and parsed lines
@@ -398,6 +399,10 @@ fn run_tui_loop(
                     .partition_point(|l| l.byte_offset < anchor);
                 state.scroll = new_idx.min(state.max_scroll());
             }
+            // Recompute search matches if a search is active.
+            if state.search.is_some() {
+                state.recompute_search_matches();
+            }
         }
 
         // Update lines/sec counter every second.
@@ -427,13 +432,33 @@ fn run_tui_loop(
                         }
                         continue;
                     }
-                    match map_event(key) {
-                        AppAction::Quit => {
-                            state.quit_requested = true;
-                            break;
+
+                    // In input mode, handle character typing directly.
+                    if state.input_mode != InputMode::Normal {
+                        match map_input_event(key) {
+                            InputAction::Char(c) => {
+                                state.input_buffer.push(c);
+                            }
+                            InputAction::Backspace => {
+                                state.input_buffer.pop();
+                            }
+                            InputAction::Confirm => {
+                                state.apply(AppAction::ConfirmInput);
+                            }
+                            InputAction::Cancel => {
+                                state.apply(AppAction::CancelInput);
+                            }
+                            InputAction::Ignore => {}
                         }
-                        AppAction::Noop => {}
-                        other => state.apply(other),
+                    } else {
+                        match map_event(key) {
+                            AppAction::Quit => {
+                                state.quit_requested = true;
+                                break;
+                            }
+                            AppAction::Noop => {}
+                            other => state.apply(other),
+                        }
                     }
                 }
                 // Non-blocking check: are there more events queued?

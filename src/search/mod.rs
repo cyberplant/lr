@@ -24,6 +24,14 @@ impl Search {
     pub fn is_match(&self, s: &str) -> bool {
         self.re.is_match(s)
     }
+
+    /// Find all match positions (start, end) in the given text.
+    pub fn find_iter(&self, s: &str) -> Vec<(usize, usize)> {
+        self.re
+            .find_iter(s)
+            .map(|m| (m.start(), m.end()))
+            .collect()
+    }
 }
 
 #[cfg(test)]

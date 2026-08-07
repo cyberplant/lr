@@ -23,7 +23,10 @@ pub enum AppAction {
     Search,
     NextMatch,
     PrevMatch,
+    ClearSearch,
     CommandBar,
+    ConfirmInput,
+    CancelInput,
     ToggleSidebar,
     ToggleSeverityError,
     ToggleSeverityWarn,
@@ -55,6 +58,7 @@ pub fn map_event(key: KeyEvent) -> AppAction {
         KeyCode::Char('/') => AppAction::Search,
         KeyCode::Char('n') => AppAction::NextMatch,
         KeyCode::Char('N') => AppAction::PrevMatch,
+        KeyCode::Esc => AppAction::ClearSearch,
         KeyCode::Char(':') => AppAction::CommandBar,
         KeyCode::Tab => AppAction::ToggleSidebar,
         KeyCode::Char('1') => AppAction::ToggleSeverityError,
@@ -67,6 +71,29 @@ pub fn map_event(key: KeyEvent) -> AppAction {
         KeyCode::Enter => AppAction::ExpandEntry,
         _ => AppAction::Noop,
     }
+}
+
+/// Map a key event when in search/command input mode.
+/// Characters append to the buffer, Enter confirms, Esc cancels,
+/// Backspace deletes.
+pub fn map_input_event(key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Enter => InputAction::Confirm,
+        KeyCode::Esc => InputAction::Cancel,
+        KeyCode::Backspace => InputAction::Backspace,
+        KeyCode::Char(c) => InputAction::Char(c),
+        _ => InputAction::Ignore,
+    }
+}
+
+/// Action for input mode key handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputAction {
+    Char(char),
+    Backspace,
+    Confirm,
+    Cancel,
+    Ignore,
 }
 
 #[cfg(test)]
