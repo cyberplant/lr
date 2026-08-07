@@ -57,6 +57,25 @@ impl Registry {
         }
         best.map(|(_, p)| p)
     }
+
+    pub fn get_by_name(&self, name: &str) -> Option<&dyn Plugin> {
+        self.plugins
+            .iter()
+            .find(|p| p.name() == name)
+            .map(|p| p.as_ref())
+    }
+}
+
+/// Build a registry with all built-in Rust core format plugins.
+/// Always-on plugins (timestamp, severity) are not in the registry —
+/// the `Parser` runs them unconditionally after the format plugin.
+pub fn build_default_registry() -> Registry {
+    let mut r = Registry::new();
+    r.register(Box::new(rust::jsonl::Jsonl));
+    r.register(Box::new(rust::logfmt::Logfmt));
+    r.register(Box::new(rust::syslog::Syslog));
+    r.register(Box::new(rust::clf::Clf));
+    r
 }
 
 impl Default for Registry {

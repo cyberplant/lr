@@ -39,14 +39,29 @@ debug/trace).
 ## Module map
 
 - `src/main.rs` — entry point, module declarations.
-- `src/cli.rs` — clap arg parsing, tracing init.
+- `src/cli.rs` — clap arg parsing, tracing init, tokio runtime creation.
 - `src/config.rs` — `~/.config/lr/config.toml` loading.
 - `src/theme.rs` — color themes.
 - `src/app/` — TUI run loop, state, key event → action mapping.
-- `src/io/` — dual-FD file open, tail-follow, line buffer, stdin.
-- `src/pipeline/` — parser pipeline, line-offset index, `ParsedLine`.
+- `src/io/` — dual-FD file open, head/tail/stdin readers, line splitter, line buffer.
+- `src/pipeline/` — parser pipeline, line-offset index, `ParsedLine`, `Parser`.
 - `src/plugin/` — `Plugin` trait, registry, Rust core plugins, Lua host.
 - `src/db/` — `Storage` trait + SQLite impl.
 - `src/search/` — regex/literal search.
 - `src/filter/` — filter expression AST.
 - `src/ui/` — ratatui rendering.
+
+## Pipeline architecture (phase 1)
+
+The data flow is: **readers → [raw channel] → parser → [parsed channel] → UI**.
+
+- Head reader (`spawn_blocking`): reads file from byte 0 to initial EOF.
+- Tail reader (`spawn_blocking`): polls for appends every 100ms, follows file.
+- Stdin reader (`spawn_blocking`): reads stdin line-by-line.
+- Parser (`tokio::spawn`): receives `RawLine`s, runs plugin chain (format
+  detection → timestamp → severity), sends `ParsedLine`s.
+- UI (main thread): sync event loop, drains parsed lines via `try_recv`,
+  renders at ~30fps, polls keyboard with 50ms timeout.
+
+Channels are bounded (10k capacity) for natural backpressure. The tail reader
+checks `tx.is_closed()` each iteration to exit cleanly when the UI quits.

@@ -68,7 +68,8 @@ impl Cli {
     pub fn parse_and_run() -> Result<()> {
         let cli = Cli::parse();
         cli.init_tracing()?;
-        crate::app::run(cli)
+        let rt = tokio::runtime::Runtime::new().context("create tokio runtime")?;
+        rt.block_on(crate::app::run(cli))
     }
 
     fn init_tracing(&self) -> Result<()> {
