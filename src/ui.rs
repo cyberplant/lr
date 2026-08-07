@@ -132,19 +132,8 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
         format!("Processing: {:.0}%", state.progress.fraction() * 100.0)
     };
 
-    // Line count display: show estimated count with "(est!)" if estimated,
-    // or actual count if exact.
-    let (line_count_str, line_count_color) = if state.progress.lines_estimated() {
-        (
-            format!("~{} (est!)", state.progress.estimated_total_lines()),
-            Color::Yellow,
-        )
-    } else {
-        (format!("{}", state.stats.total_lines), Color::Yellow)
-    };
-
     // Scroll position: use the line_no of the first visible line (if any)
-    // and the estimated/exact total.
+    // and the estimated/exact total. Show "(est!)" suffix when estimated.
     let (pos_str, pos_color) = if state.lines.is_empty() {
         ("0/0".to_string(), Color::White)
     } else {
@@ -155,7 +144,11 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
             state.lines.len() as u64
         };
         let current = first_visible.line_no;
-        (format!("{}/{}", current, total), Color::White)
+        if state.progress.lines_estimated() {
+            (format!("{}/{} (est!)", current, total), Color::Yellow)
+        } else {
+            (format!("{}/{}", current, total), Color::White)
+        }
     };
 
     let sev_flags = format!(
@@ -176,8 +169,6 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(line_count_str, Style::default().fg(line_count_color)),
-        Span::raw("  |  "),
         Span::styled(
             format!("{:.0} L/s", state.stats.lines_per_sec),
             Style::default().fg(Color::Cyan),
@@ -190,7 +181,7 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
         Span::styled(pos_str, Style::default().fg(pos_color)),
     ]);
 
-    let bar = Paragraph::new(line).style(Style::default().bg(Color::DarkGray));
+    let bar = Paragraph::new(line).style(Style::default().bg(Color::Blue));
     frame.render_widget(bar, area);
 }
 

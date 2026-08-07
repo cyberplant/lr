@@ -107,11 +107,23 @@ async fn run_repl(
                 if new_lines > 0 {
                     lines_this_sec += new_lines;
                     // Sort by byte offset to merge head and tail output.
+                    // Save anchor for scroll restoration.
                     let mut s = state.lock().await;
+                    let anchor_offset = if !s.follow && !s.lines.is_empty() {
+                        let idx = s.scroll.min(s.lines.len() - 1);
+                        Some(s.lines[idx].byte_offset)
+                    } else {
+                        None
+                    };
                     s.lines.sort_by_key(|l| l.byte_offset);
                     renumber_lines(&mut s);
                     if s.follow {
                         s.scroll_to_bottom();
+                    } else if let Some(anchor) = anchor_offset {
+                        let new_idx = s
+                            .lines
+                            .partition_point(|l| l.byte_offset < anchor);
+                        s.scroll = new_idx.min(s.max_scroll());
                     }
                 }
                 if sec_start.elapsed() >= Duration::from_secs(1) {
@@ -363,15 +375,28 @@ fn run_tui_loop(
         }
         if new_lines > 0 {
             lines_this_sec += new_lines;
+            // Save the byte_offset of the first visible line so we can
+            // restore the scroll position after sorting (head reader may
+            // insert lines before the current position, shifting indices).
+            let anchor_offset = if !state.follow && !state.lines.is_empty() {
+                let idx = state.scroll.min(state.lines.len() - 1);
+                Some(state.lines[idx].byte_offset)
+            } else {
+                None
+            };
             // Sort lines by byte offset to merge head and tail reader output.
             state.lines.sort_by_key(|l| l.byte_offset);
-            // Renumber lines. When the head reader is still running and we
-            // only have tail lines, start numbering from the estimated total
-            // so the user sees correct positions (e.g., 4980/5000 not 1/20).
+            // Renumber lines.
             renumber_lines(state);
-            // If following, snap to the bottom.
             if state.follow {
+                // If following, snap to the bottom.
                 state.scroll_to_bottom();
+            } else if let Some(anchor) = anchor_offset {
+                // Restore scroll to the same line (by byte_offset).
+                let new_idx = state
+                    .lines
+                    .partition_point(|l| l.byte_offset < anchor);
+                state.scroll = new_idx.min(state.max_scroll());
             }
         }
 

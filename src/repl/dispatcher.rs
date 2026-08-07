@@ -141,7 +141,8 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
         Command::End => {
             let mut state = repl.state.lock().await;
             state.apply(AppAction::End);
-            DispatchResult::ok(format!("at end (line {})\n", state.lines.len()))
+            let last_line = state.lines.last().map(|l| l.line_no).unwrap_or(0);
+            DispatchResult::ok(format!("at end (line {})\n", last_line))
         }
         Command::Follow { on } => {
             let mut state = repl.state.lock().await;
@@ -192,9 +193,21 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
         }
         Command::Stats => {
             let state = repl.state.lock().await;
+            let total = if state.progress.lines_estimated() {
+                state.progress.estimated_total_lines()
+            } else {
+                state.stats.total_lines as u64
+            };
+            let current_line = if state.lines.is_empty() {
+                0
+            } else {
+                let idx = state.scroll.min(state.lines.len() - 1);
+                state.lines[idx].line_no
+            };
             DispatchResult::ok(format!(
-                "lines: {}\nlines/s: {:.1}\nfollow: {}\nscroll: {}\n",
-                state.stats.total_lines,
+                "lines: {}/{}\nlines/s: {:.1}\nfollow: {}\nscroll: {}\n",
+                current_line,
+                total,
                 state.stats.lines_per_sec,
                 state.follow,
                 state.scroll,
