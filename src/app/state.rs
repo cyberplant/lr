@@ -74,7 +74,7 @@ impl SeverityVisibility {
 }
 
 impl AppState {
-    pub fn new(config: Config, theme: Theme, files: Vec<PathBuf>) -> Self {
+    pub fn new(config: Config, theme: Theme, files: Vec<PathBuf>, follow: bool) -> Self {
         let message = if files.is_empty() {
             "no files given — pass paths or --stdin".to_string()
         } else {
@@ -87,7 +87,7 @@ impl AppState {
             quit_requested: false,
             lines: Vec::new(),
             scroll: 0,
-            follow: true, // follow by default (END behavior)
+            follow, // head mode by default, follow only with -f
             wrap: false,
             severity_visible: SeverityVisibility::all_on(),
             stats: Stats::default(),
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn scroll_clamps_to_max() {
-        let mut s = AppState::new(Config::default(), Theme::default_theme(), vec![]);
+        let mut s = AppState::new(Config::default(), Theme::default_theme(), vec![], false);
         s.terminal_height = 10;
         for i in 0..100 {
             s.push_line(ParsedLine::stub(&format!("line {i}")));
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn home_disables_follow() {
-        let mut s = AppState::new(Config::default(), Theme::default_theme(), vec![]);
+        let mut s = AppState::new(Config::default(), Theme::default_theme(), vec![], false);
         s.follow = true;
         s.apply(AppAction::Home);
         assert!(!s.follow);
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn end_enables_follow() {
-        let mut s = AppState::new(Config::default(), Theme::default_theme(), vec![]);
+        let mut s = AppState::new(Config::default(), Theme::default_theme(), vec![], false);
         s.follow = false;
         for i in 0..50 {
             s.push_line(ParsedLine::stub(&format!("line {i}")));
@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn scroll_up_disables_follow() {
-        let mut s = AppState::new(Config::default(), Theme::default_theme(), vec![]);
+        let mut s = AppState::new(Config::default(), Theme::default_theme(), vec![], false);
         s.follow = true;
         s.apply(AppAction::ScrollUp);
         assert!(!s.follow);

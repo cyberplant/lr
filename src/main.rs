@@ -18,6 +18,7 @@ mod filter;
 mod io;
 mod pipeline;
 mod plugin;
+mod repl;
 mod search;
 mod theme;
 mod ui;

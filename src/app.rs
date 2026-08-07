@@ -1,6 +1,8 @@
 //! Application state, event mapping, and the main TUI run loop.
 
 use std::io::stdout;
+use std::io::IsTerminal;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -12,6 +14,7 @@ use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
 use crate::cli::Cli;
 use crate::config::Config;
@@ -20,7 +23,9 @@ use crate::io::reader::head_reader;
 use crate::io::stdin::stdin_reader;
 use crate::io::tail::tail_reader;
 use crate::io::RawLine;
+use crate::pipeline::index::ReadProgress;
 use crate::pipeline::parser::{ParsedLine, Parser};
+use crate::repl::dispatcher::OutputFormat;
 use crate::theme::Theme;
 
 pub mod events;
@@ -44,23 +49,115 @@ pub async fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    let mut state = AppState::new(config, theme, cli.files().to_vec());
+    let follow = cli.follow();
+    let mut state = AppState::new(config, theme, cli.files().to_vec(), follow);
 
     // Set up the pipeline: readers → [raw_rx] → parser → [parsed_rx] → UI.
     let (raw_tx, raw_rx) = mpsc::channel::<RawLine>(CHANNEL_CAPACITY);
     let (parsed_tx, parsed_rx) = mpsc::channel::<ParsedLine>(CHANNEL_CAPACITY);
 
-    spawn_sources(&cli, raw_tx);
+    // Read progress tracker — shared between head reader and REPL.
+    // For multiple files, we track the first file's progress (the primary).
+    // TODO: per-file progress tracking.
+    let file_size = cli
+        .files()
+        .first()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let progress = ReadProgress::new(file_size);
+
+    spawn_sources(&cli, raw_tx.clone(), progress.clone());
     spawn_parser(raw_rx, parsed_tx);
 
-    enter_raw_mode()?;
-    let result = run_loop(&mut state, parsed_rx);
-    let _ = restore_terminal();
-    result
+    if cli.should_use_repl_mode() {
+        run_repl(cli, state, raw_tx, parsed_rx, progress).await
+    } else {
+        enter_raw_mode()?;
+        let result = run_tui_loop(&mut state, parsed_rx);
+        let _ = restore_terminal();
+        result
+    }
+}
+
+/// Run in REPL/TCP mode (non-TTY).
+async fn run_repl(
+    cli: Cli,
+    state: AppState,
+    raw_tx: mpsc::Sender<RawLine>,
+    mut parsed_rx: mpsc::Receiver<ParsedLine>,
+    progress: ReadProgress,
+) -> Result<()> {
+    let state = Arc::new(Mutex::new(state));
+
+    // Background task: drain parsed lines into state.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut lines_this_sec: u64 = 0;
+            let mut sec_start = Instant::now();
+            loop {
+                while let Ok(line) = parsed_rx.try_recv() {
+                    let mut s = state.lock().await;
+                    s.push_line(line);
+                    if s.follow {
+                        s.scroll_to_bottom();
+                    }
+                    lines_this_sec += 1;
+                }
+                if sec_start.elapsed() >= Duration::from_secs(1) {
+                    let mut s = state.lock().await;
+                    s.stats.lines_per_sec = lines_this_sec as f64 / sec_start.elapsed().as_secs_f64();
+                    lines_this_sec = 0;
+                    sec_start = Instant::now();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+    }
+
+    let format = if cli.json() {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Text
+    };
+
+    // Start TCP server if --listen is given.
+    if let Some(addr) = cli.listen().map(str::to_owned) {
+        let state = state.clone();
+        let raw_tx = raw_tx.clone();
+        let progress = progress.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::repl::tcp::run(&addr, state, raw_tx, progress, format).await {
+                tracing::error!("TCP server: {e:#}");
+            }
+        });
+        // Give the TCP server a moment to bind.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Run stdin REPL if stdin is not closed (e.g. /dev/null gives EOF
+    // immediately). When --listen is given and stdin is a TTY or /dev/null,
+    // we wait for ctrl-c instead of exiting when stdin closes.
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    if (cli.repl() || cli.listen().is_none()) && !stdin_is_tty {
+        let repl = crate::repl::dispatcher::ReplState {
+            state: state.clone(),
+            raw_tx: raw_tx.clone(),
+            progress: progress.clone(),
+        };
+        crate::repl::stdin::run(repl, format).await?;
+    }
+    if cli.listen().is_some() {
+        // Keep running for the TCP server until ctrl-c.
+        tokio::signal::ctrl_c().await.ok();
+    }
+
+    Ok(())
 }
 
 /// Spawn head and tail readers for each file, or a stdin reader.
-fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>) {
+fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>, progress: ReadProgress) {
     if cli.files().is_empty() && !cli.stdin() {
         return;
     }
@@ -74,7 +171,7 @@ fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>) {
         });
     }
 
-    for path in cli.files() {
+    for (i, path) in cli.files().iter().enumerate() {
         let dual = match open_dual(path) {
             Ok(d) => d,
             Err(e) => {
@@ -86,11 +183,17 @@ fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>) {
         let size = dual.size;
 
         // Head reader: reads from byte 0 to initial EOF.
+        // Only the first file's progress is tracked (primary file).
         let tx_head = raw_tx.clone();
         let src_head = source.clone();
         let head_file = dual.head;
+        let head_progress = if i == 0 {
+            progress.clone()
+        } else {
+            ReadProgress::new(size)
+        };
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = head_reader(head_file, size, src_head, tx_head) {
+            if let Err(e) = head_reader(head_file, size, src_head, tx_head, head_progress) {
                 tracing::error!("head reader: {e:#}");
             }
         });
@@ -108,8 +211,6 @@ fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>) {
     }
 
     // Drop our own sender so the channel closes when all readers finish.
-    // (The tail reader holds a clone and runs indefinitely, so the channel
-    // only closes if there are no files and no stdin.)
     drop(raw_tx);
 }
 
@@ -127,9 +228,9 @@ fn spawn_parser(mut raw_rx: mpsc::Receiver<RawLine>, parsed_tx: mpsc::Sender<Par
     });
 }
 
-/// The main UI event loop. Polls keyboard input with a short timeout and
+/// The main TUI event loop. Polls keyboard input with a short timeout and
 /// drains parsed lines from the channel between polls.
-fn run_loop(
+fn run_tui_loop(
     state: &mut AppState,
     parsed_rx: mpsc::Receiver<ParsedLine>,
 ) -> Result<()> {

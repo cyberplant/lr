@@ -36,6 +36,26 @@ debug/trace).
 - **Architecture**: see `PLAN.md`. Phases 0-7 are defined there. Each phase
   has explicit TODOs in the source marked `TODO(phase N)`.
 
+## REPL / TCP mode
+
+When stdout is not a TTY (piped), or `--repl` is given, lr enters REPL mode
+instead of the TUI. Commands are read from stdin and responses printed to
+stdout. Use `--json` for JSON output. Use `--listen <addr:port>` to start a
+TCP command server (can be combined with `--repl`).
+
+Key commands: `open`, `readfile full|quick|x%`, `show`, `goto`, `stats`,
+`fields`, `json`, `severity`, `follow`, `help`, `quit`.
+
+`readfile` blocks until the head reader reaches a milestone:
+- `full` — entire file read
+- `quick` — first lines available + tail at EOF
+- `50%` — 50% of file by bytes read
+
+## Default mode
+
+lr starts in **head mode** (showing the beginning of the file). Use `-f` or
+`--follow` to start in follow/tail mode (like `tail -f`).
+
 ## Module map
 
 - `src/main.rs` — entry point, module declarations.

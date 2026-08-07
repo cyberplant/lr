@@ -1,5 +1,6 @@
 //! Command-line interface.
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -30,9 +31,29 @@ pub struct Cli {
     #[arg(short = 'p', long)]
     plugin: Option<String>,
 
+    /// Follow mode: start at the end and tail for new lines (like tail -f).
+    /// Without this flag, lr starts at the beginning of the file (head mode).
+    #[arg(short = 'f', long)]
+    follow: bool,
+
     /// Verbosity for the debug log written to ~/.local/share/lr/debug.log.
     #[arg(short = 'v', long, default_value = "info")]
     log_level: LogLevel,
+
+    /// Force REPL (command) mode even if stdout is a TTY.
+    /// REPL mode reads text commands from stdin and prints text/JSON output.
+    /// Auto-activated when stdout is not a TTY.
+    #[arg(long)]
+    repl: bool,
+
+    /// Start a TCP command server on the given address (e.g. 127.0.0.1:9999).
+    /// Implies non-TTY mode. Can be combined with --repl for stdin + TCP.
+    #[arg(long)]
+    listen: Option<String>,
+
+    /// Output JSON instead of text in REPL/TCP mode.
+    #[arg(long)]
+    json: bool,
 
     /// Print the effective config and exit (for debugging setup).
     #[arg(long)]
@@ -117,8 +138,30 @@ impl Cli {
         self.plugin.as_deref()
     }
 
+    pub fn follow(&self) -> bool {
+        self.follow
+    }
+
     pub fn print_config(&self) -> bool {
         self.print_config
+    }
+
+    pub fn repl(&self) -> bool {
+        self.repl
+    }
+
+    pub fn listen(&self) -> Option<&str> {
+        self.listen.as_deref()
+    }
+
+    pub fn json(&self) -> bool {
+        self.json
+    }
+
+    /// Returns true if the app should run in REPL/TCP mode instead of TUI.
+    /// This is when --repl is given, --listen is given, or stdout is not a TTY.
+    pub fn should_use_repl_mode(&self) -> bool {
+        self.repl || self.listen.is_some() || !std::io::stdout().is_terminal()
     }
 }
 
