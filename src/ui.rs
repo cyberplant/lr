@@ -78,7 +78,7 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
             continue;
         }
 
-        lines_rendered.push(render_line(pl, area.width as usize));
+        lines_rendered.push(render_line(pl, area.width as usize, state.show_line_numbers));
     }
 
     // If we filtered out lines and haven't filled the view, keep going.
@@ -90,7 +90,7 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
         {
             continue;
         }
-        lines_rendered.push(render_line(pl, area.width as usize));
+        lines_rendered.push(render_line(pl, area.width as usize, state.show_line_numbers));
     }
 
     let block = Block::default().borders(Borders::ALL).title(title);
@@ -98,7 +98,7 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
     frame.render_widget(paragraph, area);
 }
 
-fn render_line(pl: &crate::pipeline::parser::ParsedLine, _width: usize) -> Line<'static> {
+fn render_line(pl: &crate::pipeline::parser::ParsedLine, _width: usize, show_line_no: bool) -> Line<'static> {
     let color = match pl.severity {
         Some(Severity::Error) => Color::Red,
         Some(Severity::Warn) => Color::Yellow,
@@ -108,18 +108,29 @@ fn render_line(pl: &crate::pipeline::parser::ParsedLine, _width: usize) -> Line<
         None => Color::Reset,
     };
 
-    Line::from(vec![Span::styled(
-        pl.raw.clone(),
-        Style::default().fg(color),
-    )])
+    if show_line_no {
+        Line::from(vec![
+            Span::styled(format!("{:>6} ", pl.line_no), Style::default().fg(Color::DarkGray)),
+            Span::styled(pl.raw.clone(), Style::default().fg(color)),
+        ])
+    } else {
+        Line::from(vec![Span::styled(
+            pl.raw.clone(),
+            Style::default().fg(color),
+        )])
+    }
 }
 
 fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
     let follow_indicator = if state.follow { "FOLLOW" } else { "  --  " };
 
-    // File position as percentage.
-    let file_pct = state.progress.fraction() * 100.0;
-    let file_pos = format!("{:.0}%", file_pct);
+    // File processing indicator: "Processing: X%" while head reader is
+    // running, "Loaded" when done.
+    let processing_str = if state.progress.head_done() {
+        "Loaded".to_string()
+    } else {
+        format!("Processing: {:.0}%", state.progress.fraction() * 100.0)
+    };
 
     // Line count display: show estimated count with "(est!)" if estimated,
     // or actual count if exact.
@@ -132,10 +143,19 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
         (format!("{}", state.stats.total_lines), Color::Yellow)
     };
 
-    let pos = if state.lines.is_empty() {
-        "0/0".to_string()
+    // Scroll position: use the line_no of the first visible line (if any)
+    // and the estimated/exact total.
+    let (pos_str, pos_color) = if state.lines.is_empty() {
+        ("0/0".to_string(), Color::White)
     } else {
-        format!("{}/{}", state.scroll + 1, state.lines.len())
+        let first_visible = &state.lines[state.scroll.min(state.lines.len() - 1)];
+        let total = if state.progress.lines_estimated() {
+            state.progress.estimated_total_lines()
+        } else {
+            state.lines.len() as u64
+        };
+        let current = first_visible.line_no;
+        (format!("{}/{}", current, total), Color::White)
     };
 
     let sev_flags = format!(
@@ -165,9 +185,9 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
         Span::raw("  |  "),
         Span::styled(sev_flags, Style::default().fg(Color::White)),
         Span::raw("  |  "),
-        Span::styled(file_pos, Style::default().fg(Color::Magenta)),
+        Span::styled(processing_str, Style::default().fg(Color::Magenta)),
         Span::raw("  |  "),
-        Span::styled(pos, Style::default().fg(Color::White)),
+        Span::styled(pos_str, Style::default().fg(pos_color)),
     ]);
 
     let bar = Paragraph::new(line).style(Style::default().bg(Color::DarkGray));
@@ -176,7 +196,7 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
 
 fn render_command_bar(frame: &mut Frame, _state: &AppState, area: ratatui::layout::Rect) {
     let hint = Line::from(Span::styled(
-        " : command  / search  f follow  HOME/END  1-5 severity  ? help  q quit",
+        " : command  / search  f follow  l line#  HOME/END  1-5 severity  ? help  q quit",
         Style::default().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(hint), area);

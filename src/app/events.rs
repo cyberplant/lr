@@ -31,6 +31,7 @@ pub enum AppAction {
     ToggleSeverityDebug,
     ToggleSeverityTrace,
     ToggleWrap,
+    ToggleLineNumbers,
     ExpandEntry,
 }
 
@@ -62,6 +63,7 @@ pub fn map_event(key: KeyEvent) -> AppAction {
         KeyCode::Char('4') => AppAction::ToggleSeverityDebug,
         KeyCode::Char('5') => AppAction::ToggleSeverityTrace,
         KeyCode::Char('w') => AppAction::ToggleWrap,
+        KeyCode::Char('l') => AppAction::ToggleLineNumbers,
         KeyCode::Enter => AppAction::ExpandEntry,
         _ => AppAction::Noop,
     }

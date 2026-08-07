@@ -109,9 +109,7 @@ async fn run_repl(
                     // Sort by byte offset to merge head and tail output.
                     let mut s = state.lock().await;
                     s.lines.sort_by_key(|l| l.byte_offset);
-                    for (i, line) in s.lines.iter_mut().enumerate() {
-                        line.line_no = (i + 1) as u64;
-                    }
+                    renumber_lines(&mut s);
                     if s.follow {
                         s.scroll_to_bottom();
                     }
@@ -203,6 +201,9 @@ fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>, progress: ReadProgres
         let source = path.to_string_lossy().to_string();
         let size = dual.size;
         let tail_start = dual.tail_start;
+        if i == 0 {
+            progress.set_tail_start(tail_start);
+        }
 
         // Head reader: reads from byte 0 to tail_start (stops before tail's region).
         let tx_head = raw_tx.clone();
@@ -249,6 +250,82 @@ fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>, progress: ReadProgres
     drop(raw_tx);
 }
 
+/// Renumber lines after sorting by byte_offset.
+///
+/// Three cases:
+/// 1. Head done: number all lines sequentially 1..N (sort gives correct order).
+/// 2. Tail only (no head lines): start from estimated_total - N + 1.
+/// 3. Both head and tail lines, head not done: number head lines 1..head_count,
+///    tail lines from estimated_total - tail_count + 1. There's a gap between
+///    them, which is fine — binary search handles it.
+fn renumber_lines(state: &mut AppState) {
+    if state.lines.is_empty() {
+        return;
+    }
+
+    let head_done = state.progress.head_done();
+    let tail_start = state.progress.tail_start();
+
+    if head_done {
+        // Head is done — number everything sequentially.
+        for (i, line) in state.lines.iter_mut().enumerate() {
+            line.line_no = (i + 1) as u64;
+        }
+        return;
+    }
+
+    // Count head and tail lines.
+    let mut head_count = 0u64;
+    let mut tail_count = 0u64;
+    for line in &state.lines {
+        if line.byte_offset < tail_start {
+            head_count += 1;
+        } else {
+            tail_count += 1;
+        }
+    }
+
+    if tail_count == 0 {
+        // Only head lines — number sequentially.
+        for (i, line) in state.lines.iter_mut().enumerate() {
+            line.line_no = (i + 1) as u64;
+        }
+    } else if head_count == 0 {
+        // Only tail lines — start from estimated total.
+        let n = state.lines.len() as u64;
+        let estimated = state.progress.estimated_total_lines();
+        let start = if estimated > n {
+            estimated - n + 1
+        } else {
+            1
+        };
+        for (i, line) in state.lines.iter_mut().enumerate() {
+            line.line_no = start + i as u64;
+        }
+    } else {
+        // Both head and tail lines, head not done.
+        // Head lines: 1, 2, ..., head_count
+        // Tail lines: estimated_total - tail_count + 1, ..., estimated_total
+        let estimated = state.progress.estimated_total_lines();
+        let tail_start_no = if estimated > tail_count {
+            estimated - tail_count + 1
+        } else {
+            head_count + 1
+        };
+        let mut head_no = 1u64;
+        let mut tail_no = tail_start_no;
+        for line in state.lines.iter_mut() {
+            if line.byte_offset < tail_start {
+                line.line_no = head_no;
+                head_no += 1;
+            } else {
+                line.line_no = tail_no;
+                tail_no += 1;
+            }
+        }
+    }
+}
+
 /// Spawn the parser task that transforms raw lines into parsed lines.
 fn spawn_parser(mut raw_rx: mpsc::Receiver<RawLine>, parsed_tx: mpsc::Sender<ParsedLine>) {
     tokio::spawn(async move {
@@ -287,13 +364,11 @@ fn run_tui_loop(
         if new_lines > 0 {
             lines_this_sec += new_lines;
             // Sort lines by byte offset to merge head and tail reader output.
-            // Both readers send lines roughly in byte-offset order, but
-            // interleaved. Sorting gives the correct file order.
             state.lines.sort_by_key(|l| l.byte_offset);
-            // Renumber lines sequentially after sorting.
-            for (i, line) in state.lines.iter_mut().enumerate() {
-                line.line_no = (i + 1) as u64;
-            }
+            // Renumber lines. When the head reader is still running and we
+            // only have tail lines, start numbering from the estimated total
+            // so the user sees correct positions (e.g., 4980/5000 not 1/20).
+            renumber_lines(state);
             // If following, snap to the bottom.
             if state.follow {
                 state.scroll_to_bottom();

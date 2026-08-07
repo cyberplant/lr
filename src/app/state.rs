@@ -33,6 +33,8 @@ pub struct AppState {
     pub follow: bool,
     /// Line wrapping toggle (not yet implemented in renderer).
     pub wrap: bool,
+    /// Show line numbers on the left (default off, toggle with 'l').
+    pub show_line_numbers: bool,
     /// Visible severity levels (all true by default).
     pub severity_visible: SeverityVisibility,
 
@@ -93,6 +95,7 @@ impl AppState {
             scroll: 0,
             follow, // head mode by default, follow only with -f
             wrap: false,
+            show_line_numbers: false,
             severity_visible: SeverityVisibility::all_on(),
             stats: Stats::default(),
             message,
@@ -178,6 +181,9 @@ impl AppState {
             }
             AppAction::ToggleWrap => {
                 self.wrap = !self.wrap;
+            }
+            AppAction::ToggleLineNumbers => {
+                self.show_line_numbers = !self.show_line_numbers;
             }
             AppAction::ToggleSeverityError => self.severity_visible.error = !self.severity_visible.error,
             AppAction::ToggleSeverityWarn => self.severity_visible.warn = !self.severity_visible.warn,

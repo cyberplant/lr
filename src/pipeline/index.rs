@@ -32,6 +32,9 @@ struct ReadProgressInner {
     /// Whether the line count is estimated (true) or exact (false).
     /// Estimated until the head reader reaches the tail's start offset.
     lines_estimated: std::sync::atomic::AtomicBool,
+    /// The byte offset where the tail reader starts (= file_size - 64KB).
+    /// Lines with byte_offset >= tail_start are from the tail reader.
+    tail_start: AtomicU64,
 }
 
 impl ReadProgress {
@@ -44,6 +47,7 @@ impl ReadProgress {
                 head_done: std::sync::atomic::AtomicBool::new(false),
                 estimated_total_lines: AtomicU64::new(0),
                 lines_estimated: std::sync::atomic::AtomicBool::new(false),
+                tail_start: AtomicU64::new(0),
             }),
         }
     }
@@ -105,6 +109,17 @@ impl ReadProgress {
         self.inner.head_done.store(false, Ordering::Relaxed);
         self.inner.estimated_total_lines.store(0, Ordering::Relaxed);
         self.inner.lines_estimated.store(false, Ordering::Relaxed);
+        self.inner.tail_start.store(size.saturating_sub(crate::io::file::TAIL_INITIAL_READ), Ordering::Relaxed);
+    }
+
+    /// Set the tail start offset (where the tail reader begins).
+    pub fn set_tail_start(&self, tail_start: u64) {
+        self.inner.tail_start.store(tail_start, Ordering::Relaxed);
+    }
+
+    /// The byte offset where the tail reader starts.
+    pub fn tail_start(&self) -> u64 {
+        self.inner.tail_start.load(Ordering::Relaxed)
     }
 
     /// Set the estimated total line count, computed from the tail's 64KB chunk.

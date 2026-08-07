@@ -80,6 +80,7 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
                     let tail_start = dual.tail_start;
                     // Update the progress tracker for this new file.
                     repl.progress.update_file_size(size);
+                    repl.progress.set_tail_start(tail_start);
                     let tx = repl.raw_tx.clone();
                     let src = source.clone();
                     let head_file = dual.head;
@@ -118,7 +119,9 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
         }
         Command::Goto { line } => {
             let mut state = repl.state.lock().await;
-            let target = (line as usize).saturating_sub(1);
+            // Convert absolute line number to vector index using binary
+            // search (line numbers may have a gap between head and tail).
+            let target = line_to_index(&state, line);
             state.scroll = target.min(state.max_scroll());
             state.follow = false;
             DispatchResult::ok(format!("at line {}\n", line))
@@ -239,6 +242,7 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
                     let size = dual.size;
                     let tail_start = dual.tail_start;
                     repl.progress.update_file_size(size);
+                    repl.progress.set_tail_start(tail_start);
                     let tx = repl.raw_tx.clone();
                     let src = source.clone();
                     let head_file = dual.head;
@@ -313,7 +317,7 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
         }
         Command::Goto { line } => {
             let mut state = repl.state.lock().await;
-            let target = (line as usize).saturating_sub(1);
+            let target = line_to_index(&state, line);
             state.scroll = target.min(state.max_scroll());
             state.follow = false;
             DispatchResult::ok(r#"{"ok":true}"#.into())
@@ -387,7 +391,7 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
         }
         Command::Fields { line } => {
             let state = repl.state.lock().await;
-            let idx = (line as usize).saturating_sub(1);
+            let idx = line_to_index(&state, line);
             match state.lines.get(idx) {
                 Some(pl) => {
                     let fields: serde_json::Value = pl
@@ -407,7 +411,7 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
         }
         Command::Json { line } => {
             let state = repl.state.lock().await;
-            let idx = (line as usize).saturating_sub(1);
+            let idx = line_to_index(&state, line);
             match state.lines.get(idx).and_then(|pl| pl.json.as_ref()) {
                 Some(v) => DispatchResult::ok(
                     serde_json::json!({"ok": true, "line": line, "json": v}).to_string(),
@@ -459,11 +463,16 @@ async fn readfile(mode: ReadFileMode, repl: &ReplState) -> DispatchResult {
                     }
                 }
                 ReadFileMode::Quick => {
-                    // Quick = we have at least some lines from the head AND
-                    // the tail is at EOF (which is true from open_dual).
-                    // So just check we have at least 1 line parsed.
+                    // Quick = tail reader has completed its initial backward
+                    // read (estimated_total_lines is set) AND those lines
+                    // have been drained into state.
                     let state = repl.state.lock().await;
-                    if !state.lines.is_empty() || p.head_done() {
+                    let has_tail_lines = state.lines.iter().any(|l| {
+                        l.byte_offset >= progress.tail_start()
+                    });
+                    if (has_tail_lines && progress.estimated_total_lines() > 0)
+                        || p.head_done()
+                    {
                         return;
                     }
                 }
@@ -521,7 +530,12 @@ async fn readfile_json(mode: ReadFileMode, repl: &ReplState) -> DispatchResult {
                 }
                 ReadFileMode::Quick => {
                     let state = repl.state.lock().await;
-                    if !state.lines.is_empty() || p.head_done() {
+                    let has_tail_lines = state.lines.iter().any(|l| {
+                        l.byte_offset >= progress.tail_start()
+                    });
+                    if (has_tail_lines && progress.estimated_total_lines() > 0)
+                        || p.head_done()
+                    {
                         return;
                     }
                 }
@@ -637,7 +651,7 @@ fn render_lines(state: &AppState, from: u64, count: u64, _plain: bool) -> String
     let mut out = String::new();
     let end = from.saturating_add(count);
     for i in from..end {
-        let idx = (i as usize).saturating_sub(1);
+        let idx = line_to_index(state, i);
         match state.lines.get(idx) {
             Some(pl) => {
                 out.push_str(&format!("{}\n", pl.raw));
@@ -649,7 +663,7 @@ fn render_lines(state: &AppState, from: u64, count: u64, _plain: bool) -> String
 }
 
 fn render_fields(state: &AppState, line: u64) -> DispatchResult {
-    let idx = (line as usize).saturating_sub(1);
+    let idx = line_to_index(state, line);
     match state.lines.get(idx) {
         Some(pl) => {
             let mut out = format!("line {}:\n", line);
@@ -671,8 +685,22 @@ fn render_fields(state: &AppState, line: u64) -> DispatchResult {
     }
 }
 
+/// Convert a 1-based line number to a vector index.
+/// Uses binary search since line numbers are monotonically increasing
+/// after sorting by byte_offset (head lines 1..N, then tail lines
+/// estimated_start..estimated_total, with a gap between them).
+fn line_to_index(state: &AppState, line: u64) -> usize {
+    if state.lines.is_empty() {
+        return 0;
+    }
+    // Binary search for the line with the matching line_no.
+    state
+        .lines
+        .partition_point(|pl| pl.line_no < line)
+}
+
 fn render_json(state: &AppState, line: u64) -> DispatchResult {
-    let idx = (line as usize).saturating_sub(1);
+    let idx = line_to_index(state, line);
     match state.lines.get(idx).and_then(|pl| pl.json.as_ref()) {
         Some(v) => {
             let pretty = serde_json::to_string_pretty(v).unwrap_or_else(|e| format!("<error: {e}>"));
