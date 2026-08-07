@@ -595,22 +595,19 @@ fn render_viewport(state: &AppState, plain: bool) -> String {
 
     let visible = visible_lines(state);
     let mut out = String::with_capacity(visible.len() * 80);
-    for (no, sev, raw) in visible {
+    for (_no, sev, raw) in visible {
         if plain {
-            out.push_str(&format!("{:>6} [{}] {}\n", no, sev, raw));
+            out.push_str(&format!("{}\n", raw));
         } else {
-            let (sev_str, color) = match sev {
-                "E" => ("E", "\x1b[31m"),
-                "W" => ("W", "\x1b[33m"),
-                "I" => ("I", "\x1b[36m"),
-                "D" => ("D", "\x1b[90m"),
-                "T" => ("T", "\x1b[90m"),
-                _ => (" ", ""),
+            let color = match sev {
+                "E" => "\x1b[31m",
+                "W" => "\x1b[33m",
+                "I" => "\x1b[36m",
+                "D" => "\x1b[90m",
+                "T" => "\x1b[90m",
+                _ => "\x1b[0m",
             };
-            out.push_str(&format!(
-                "{:>6} \x1b[90m[\x1b[0m{}{}\x1b[0m\x1b[90m]\x1b[0m {}\n",
-                no, color, sev_str, raw
-            ));
+            out.push_str(&format!("{}{}\x1b[0m\n", color, raw));
         }
     }
     out
@@ -643,12 +640,7 @@ fn render_lines(state: &AppState, from: u64, count: u64, _plain: bool) -> String
         let idx = (i as usize).saturating_sub(1);
         match state.lines.get(idx) {
             Some(pl) => {
-                out.push_str(&format!(
-                    "{:>6} [{}] {}\n",
-                    pl.line_no,
-                    severity_char(pl.severity),
-                    pl.raw
-                ));
+                out.push_str(&format!("{}\n", pl.raw));
             }
             None => break,
         }

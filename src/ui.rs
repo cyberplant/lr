@@ -99,24 +99,19 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
 }
 
 fn render_line(pl: &crate::pipeline::parser::ParsedLine, _width: usize) -> Line<'static> {
-    let (badge_char, badge_color) = match pl.severity {
-        Some(Severity::Error) => ("E", Color::Red),
-        Some(Severity::Warn) => ("W", Color::Yellow),
-        Some(Severity::Info) => ("I", Color::Cyan),
-        Some(Severity::Debug) => ("D", Color::DarkGray),
-        Some(Severity::Trace) => ("T", Color::DarkGray),
-        None => (" ", Color::Reset),
+    let color = match pl.severity {
+        Some(Severity::Error) => Color::Red,
+        Some(Severity::Warn) => Color::Yellow,
+        Some(Severity::Info) => Color::Cyan,
+        Some(Severity::Debug) => Color::DarkGray,
+        Some(Severity::Trace) => Color::DarkGray,
+        None => Color::Reset,
     };
 
-    let line_no_str = format!("{:>6} ", pl.line_no);
-
-    Line::from(vec![
-        Span::styled(line_no_str, Style::default().fg(Color::DarkGray)),
-        Span::raw("["),
-        Span::styled(badge_char, Style::default().fg(badge_color).add_modifier(Modifier::BOLD)),
-        Span::raw("] "),
-        Span::raw(pl.raw.clone()),
-    ])
+    Line::from(vec![Span::styled(
+        pl.raw.clone(),
+        Style::default().fg(color),
+    )])
 }
 
 fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
