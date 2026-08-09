@@ -38,6 +38,22 @@ pub enum FieldValue {
     Str(String),
 }
 
+impl FieldValue {
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            FieldValue::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            FieldValue::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
 impl ParsedLine {
     /// Construct a minimal stub line for tests.
     pub fn stub(raw: &str) -> Self {
