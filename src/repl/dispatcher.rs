@@ -49,6 +49,7 @@ pub struct ReplState {
     pub state: Arc<Mutex<AppState>>,
     pub raw_tx: mpsc::Sender<RawLine>,
     pub progress: ReadProgress,
+    pub db: Option<crate::db::SharedDb>,
 }
 
 /// Execute a command against the shared state.
@@ -188,8 +189,60 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
             DispatchResult::ok(format!("filter set: {expr}\n"))
         }
         Command::Sql { query } => {
-            // TODO(phase 4): execute SQL against the in-memory DB.
-            DispatchResult::ok(format!("sql: not yet implemented (would run: {query})\n"))
+            match &repl.db {
+                Some(db) => {
+                    let db = db.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let store = db.blocking_lock();
+                        store.query(&query)
+                    }).await {
+                        Ok(Ok(rows)) => {
+                            if rows.is_empty() {
+                                DispatchResult::ok("(no rows)\n".into())
+                            } else {
+                                let mut out = format_query_result(&rows);
+                                out.push('\n');
+                                DispatchResult::ok(out)
+                            }
+                        }
+                        Ok(Err(e)) => DispatchResult::ok(format!("sql error: {e}\n")),
+                        Err(e) => DispatchResult::ok(format!("sql error: task join: {e}\n")),
+                    }
+                }
+                None => DispatchResult::ok("sql: database not available\n".into()),
+            }
+        }
+        Command::Histogram { bucket_secs } => {
+            match &repl.db {
+                Some(db) => {
+                    let db = db.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let store = db.blocking_lock();
+                        store.histogram(bucket_secs)
+                    }).await {
+                        Ok(Ok(buckets)) => {
+                            if buckets.is_empty() {
+                                DispatchResult::ok("(no timestamps found)\n".into())
+                            } else {
+                                let mut out = String::new();
+                                out.push_str(&format!("histogram ({}s buckets):\n", bucket_secs));
+                                let max_count = buckets.iter().map(|(_, c)| *c).max().unwrap_or(1);
+                                for (bucket_ns, count) in &buckets {
+                                    let bar_len = (*count as f64 / max_count as f64 * 40.0) as usize;
+                                    let bar = "#".repeat(bar_len);
+                                    let secs = bucket_ns / 1_000_000_000;
+                                    out.push_str(&format!("  {:>12} | {:>6} {}\n", secs, count, bar));
+                                }
+                                out.push('\n');
+                                DispatchResult::ok(out)
+                            }
+                        }
+                        Ok(Err(e)) => DispatchResult::ok(format!("histogram error: {e}\n")),
+                        Err(e) => DispatchResult::ok(format!("histogram error: task join: {e}\n")),
+                    }
+                }
+                None => DispatchResult::ok("histogram: database not available\n".into()),
+            }
         }
         Command::Stats => {
             let state = repl.state.lock().await;
@@ -446,10 +499,68 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
             DispatchResult::ok(r#"{"ok":true}"#.into())
         }
         Command::Sql { query } => {
-            DispatchResult::ok(
-                serde_json::json!({"ok": false, "error": "SQL not yet implemented", "query": query})
-                    .to_string(),
-            )
+            match &repl.db {
+                Some(db) => {
+                    let db = db.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let store = db.blocking_lock();
+                        store.query(&query)
+                    }).await {
+                        Ok(Ok(rows)) => {
+                            let rows_json: Vec<serde_json::Value> = rows.iter().map(|r| {
+                                let mut obj = serde_json::Map::new();
+                                for (col, val) in r.columns.iter().zip(&r.values) {
+                                    obj.insert(col.clone(), serde_json::Value::String(val.clone()));
+                                }
+                                serde_json::Value::Object(obj)
+                            }).collect();
+                            DispatchResult::ok(
+                                serde_json::json!({"ok": true, "rows": rows_json, "count": rows.len()})
+                                    .to_string(),
+                            )
+                        }
+                        Ok(Err(e)) => DispatchResult::ok(
+                            serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                        ),
+                        Err(e) => DispatchResult::ok(
+                            serde_json::json!({"ok": false, "error": format!("task join: {e}")}).to_string(),
+                        ),
+                    }
+                }
+                None => DispatchResult::ok(
+                    serde_json::json!({"ok": false, "error": "database not available"}).to_string(),
+                ),
+            }
+        }
+        Command::Histogram { bucket_secs } => {
+            match &repl.db {
+                Some(db) => {
+                    let db = db.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let store = db.blocking_lock();
+                        store.histogram(bucket_secs)
+                    }).await {
+                        Ok(Ok(buckets)) => {
+                            let buckets_json: Vec<serde_json::Value> = buckets.iter().map(|(b, c)| {
+                                serde_json::json!({"bucket": b, "count": c})
+                            }).collect();
+                            DispatchResult::ok(
+                                serde_json::json!({"ok": true, "buckets": buckets_json, "bucket_secs": bucket_secs})
+                                    .to_string(),
+                            )
+                        }
+                        Ok(Err(e)) => DispatchResult::ok(
+                            serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                        ),
+                        Err(e) => DispatchResult::ok(
+                            serde_json::json!({"ok": false, "error": format!("task join: {e}")}).to_string(),
+                        ),
+                    }
+                }
+                None => DispatchResult::ok(
+                    serde_json::json!({"ok": false, "error": "database not available"}).to_string(),
+                ),
+            }
         }
         Command::ReadFile { mode } => {
             readfile_json(mode, repl).await
@@ -589,6 +700,62 @@ async fn readfile_json(mode: ReadFileMode, repl: &ReplState) -> DispatchResult {
 
 // ── Rendering helpers ────────────────────────────────────────────────────
 
+/// Format query results as a simple aligned table.
+fn format_query_result(rows: &[crate::db::QueryRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    // Column widths: start with header name length.
+    let mut widths: Vec<usize> = rows[0]
+        .columns
+        .iter()
+        .map(|c| c.len())
+        .collect();
+
+    for row in rows {
+        for (i, val) in row.values.iter().enumerate() {
+            if i < widths.len() && val.len() > widths[i] {
+                widths[i] = val.len();
+            }
+        }
+    }
+
+    let mut out = String::new();
+
+    // Header.
+    for (i, col) in rows[0].columns.iter().enumerate() {
+        if i > 0 {
+            out.push_str(" | ");
+        }
+        out.push_str(&format!("{:<w$}", col, w = widths[i]));
+    }
+    out.push('\n');
+
+    // Separator.
+    for (i, w) in widths.iter().enumerate() {
+        if i > 0 {
+            out.push_str("-+-");
+        }
+        out.push_str(&"-".repeat(*w));
+    }
+    out.push('\n');
+
+    // Rows.
+    for row in rows {
+        for (i, val) in row.values.iter().enumerate() {
+            if i > 0 {
+                out.push_str(" | ");
+            }
+            out.push_str(&format!("{:<w$}", val, w = widths.get(i).copied().unwrap_or(val.len())));
+        }
+        out.push('\n');
+    }
+
+    // Trailing newline is added by caller, so trim.
+    out.trim_end_matches('\n').to_string()
+}
+
 fn help_text() -> String {
     "\
 Commands:
@@ -603,7 +770,8 @@ Commands:
   severity <E|W|I|D|T> on|off   Toggle severity visibility
   search <pattern>         Set search pattern
   filter <expr>            Set filter expression
-  sql <query>              Run SQL query (phase 4)
+  sql <query>              Run SQL query against the in-memory DB
+  histogram <bucket_secs>  Show time histogram of line counts
   stats                    Print statistics
   lines <from> <count>     Dump raw lines
   fields <line>            Show extracted fields for a line

@@ -25,6 +25,8 @@ pub enum Command {
     Filter { expr: String },
     /// `sql <query>` — run a SQL query against the in-memory DB (phase 4).
     Sql { query: String },
+    /// `histogram <bucket_secs>` — show a time histogram of line counts.
+    Histogram { bucket_secs: i64 },
     /// `stats` — print runtime statistics.
     Stats,
     /// `lines <from> <count>` — dump raw lines starting at line N.
@@ -116,6 +118,12 @@ pub fn parse(line: &str) -> Command {
         },
         "sql" => Command::Sql {
             query: rest.to_string(),
+        },
+        "histogram" | "hist" => match rest.trim().parse::<i64>() {
+            Ok(secs) => Command::Histogram { bucket_secs: secs },
+            Err(_) => Command::Unknown {
+                raw: format!("histogram: invalid bucket size '{rest}'"),
+            },
         },
         "stats" => Command::Stats,
         "lines" | "l" => parse_lines(rest),

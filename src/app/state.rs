@@ -72,6 +72,10 @@ pub struct AppState {
     // ── Filter ──
     /// Active filter expression (if any). Lines not matching are hidden.
     pub filter: Option<Filter>,
+
+    // ── Database ──
+    /// Shared in-memory SQLite database (set when DB writer is wired in).
+    pub db: Option<crate::db::SharedDb>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -133,6 +137,7 @@ impl AppState {
             search_matches: Vec::new(),
             search_cursor: 0,
             filter: None,
+            db: None,
         }
     }
 

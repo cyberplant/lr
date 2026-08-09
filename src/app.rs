@@ -69,8 +69,14 @@ pub async fn run(cli: Cli) -> Result<()> {
     let progress = ReadProgress::new(file_size);
     state.set_progress(progress.clone());
 
+    // Create the in-memory SQLite database and wire it into the pipeline.
+    let db = crate::db::create_shared()?;
+    state.db = Some(db.clone());
+    let (db_tx, db_rx) = mpsc::channel::<ParsedLine>(CHANNEL_CAPACITY);
+    crate::db::spawn_db_writer(db, db_rx);
+
     spawn_sources(&cli, raw_tx.clone(), progress.clone(), follow);
-    spawn_parser(raw_rx, parsed_tx);
+    spawn_parser(raw_rx, parsed_tx, Some(db_tx));
 
     if cli.should_use_repl_mode() {
         run_repl(cli, state, raw_tx, parsed_rx, progress).await
@@ -149,8 +155,9 @@ async fn run_repl(
         let state = state.clone();
         let raw_tx = raw_tx.clone();
         let progress = progress.clone();
+        let db = state.lock().await.db.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::repl::tcp::run(&addr, state, raw_tx, progress, format).await {
+            if let Err(e) = crate::repl::tcp::run(&addr, state, raw_tx, progress, db, format).await {
                 tracing::error!("TCP server: {e:#}");
             }
         });
@@ -167,6 +174,7 @@ async fn run_repl(
             state: state.clone(),
             raw_tx: raw_tx.clone(),
             progress: progress.clone(),
+            db: state.lock().await.db.clone(),
         };
         crate::repl::stdin::run(repl, format).await?;
     }
@@ -340,11 +348,21 @@ fn renumber_lines(state: &mut AppState) {
 }
 
 /// Spawn the parser task that transforms raw lines into parsed lines.
-fn spawn_parser(mut raw_rx: mpsc::Receiver<RawLine>, parsed_tx: mpsc::Sender<ParsedLine>) {
+/// If a DB sender is provided, parsed lines are cloned and sent to the DB
+/// channel as well.
+fn spawn_parser(
+    mut raw_rx: mpsc::Receiver<RawLine>,
+    parsed_tx: mpsc::Sender<ParsedLine>,
+    db_tx: Option<mpsc::Sender<ParsedLine>>,
+) {
     tokio::spawn(async move {
         let mut parser = Parser::new();
         while let Some(raw) = raw_rx.recv().await {
             let parsed = parser.parse(raw);
+            // Send to DB first (non-critical: if DB is slow, don't block UI).
+            if let Some(ref db_tx) = db_tx {
+                let _ = db_tx.try_send(parsed.clone());
+            }
             if parsed_tx.send(parsed).await.is_err() {
                 break; // UI dropped the receiver (app quit)
             }

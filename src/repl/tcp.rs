@@ -21,6 +21,7 @@ pub async fn run(
     state: Arc<Mutex<AppState>>,
     raw_tx: tokio::sync::mpsc::Sender<RawLine>,
     progress: ReadProgress,
+    db: Option<crate::db::SharedDb>,
     format: OutputFormat,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr)
@@ -42,6 +43,7 @@ pub async fn run(
             state: state.clone(),
             raw_tx: raw_tx.clone(),
             progress: progress.clone(),
+            db: db.clone(),
         };
         tokio::spawn(handle_connection(stream, repl, format));
     }
