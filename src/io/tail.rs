@@ -1,4 +1,4 @@
-//! Tail-follow reader. Starts at a given offset and polls for appends,
+//! Tail-follow reader. Starts at a given offset and follows appends,
 //! reading new bytes and sending complete lines on a tokio channel.
 //!
 //! Optionally performs an initial backward read: seeks to `EOF - N` bytes,
@@ -6,9 +6,9 @@
 //! loop. This gives "tail -n" behavior — show the last screenful immediately
 //! without reading the entire file.
 //!
-//! Uses polling (file-size check every 100ms) for reliability across
-//! platforms. The `notify` crate can be used later for lower-latency
-//! event-driven watching.
+//! Uses the `notify` crate for event-driven append detection (FSEvents on
+//! macOS, inotify on Linux, ReadDirectoryChangesW on Windows). Falls back
+//! to polling (file-size check every 100ms) if the watcher fails to start.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -16,13 +16,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc::Sender;
 
 use crate::io::line_splitter::LineSplitter;
 use crate::io::RawLine;
 use crate::pipeline::index::ReadProgress;
 
-/// Poll interval for append detection when no watcher is used.
+/// Poll interval for append detection when falling back to polling.
 const POLL_INTERVAL_MS: u64 = 100;
 
 /// Default bytes to read backward from EOF for the initial tail view.
@@ -145,24 +146,63 @@ pub fn tail_reader_with_initial(
     let mut splitter = LineSplitter::new(start_offset);
     let mut buf = vec![0u8; 64 * 1024];
 
-    loop {
-        // Check if the consumer is still alive.
-        if tx.is_closed() {
-            tracing::debug!("tail: channel closed, exiting");
-            return Ok(());
-        }
+    // Set up the notify watcher. We watch the file itself; notify will use
+    // FSEvents (macOS), inotify (Linux), or ReadDirectoryChangesW (Windows).
+    // If the watcher fails to start, we fall back to polling.
+    let (notify_tx, notify_rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+    let watcher_result: anyhow::Result<RecommendedWatcher> = (|| {
+        let w = notify::recommended_watcher(notify_tx)
+            .map_err(|e| anyhow::anyhow!("create watcher: {e}"))?;
+        Ok(w)
+    })();
 
-        // Check current file size.
+    let watcher = match watcher_result {
+        Ok(mut w) => {
+            // Watch the parent directory (non-recursive) so we also catch
+            // file rotation/recreation events that replace the file.
+            let watch_path = path.parent().unwrap_or(&path);
+            match w.watch(watch_path, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    tracing::debug!("tail: watching {} for changes", watch_path.display());
+                    Some(w)
+                }
+                Err(e) => {
+                    tracing::warn!("tail: watch failed on {}, falling back to polling: {e}", watch_path.display());
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("tail: could not create watcher, falling back to polling: {e}");
+            None
+        }
+    };
+
+    // `read_new_bytes` helper: reads any new bytes from the current file
+    // position, sends complete lines, handles truncation, and updates
+    // estimated line count. Returns false if the channel is closed.
+    let read_new_bytes = |file: &mut File,
+                          splitter: &mut LineSplitter,
+                          buf: &mut [u8],
+                          tx: &Sender<RawLine>,
+                          source: &str,
+                          progress: &Option<ReadProgress>|
+     -> bool {
         let size = match std::fs::metadata(&path) {
             Ok(m) => m.len(),
             Err(e) => {
                 tracing::warn!("tail: metadata error on {}: {e}", path.display());
-                std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
-                continue;
+                return true; // keep going
             }
         };
 
-        let pos = file.stream_position()?;
+        let pos = match file.stream_position() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("tail: stream_position error: {e}");
+                return true;
+            }
+        };
 
         // Handle truncation (file shrank).
         if size < pos {
@@ -172,43 +212,105 @@ pub fn tail_reader_with_initial(
                 pos,
                 size
             );
-            file.seek(SeekFrom::Start(0))?;
-            splitter = LineSplitter::new(0);
-            continue;
+            if file.seek(SeekFrom::Start(0)).is_err() {
+                return true;
+            }
+            *splitter = LineSplitter::new(0);
+            return true;
         }
 
-        // Read any new bytes.
-        if size > pos {
-            let mut new_lines = 0u64;
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 {
+        if size <= pos {
+            return true; // nothing new
+        }
+
+        let mut new_lines = 0u64;
+        loop {
+            let n = match file.read(buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!("tail: read error: {e}");
                     break;
                 }
-                for frag in splitter.feed(&buf[..n]) {
-                    if tx
-                        .blocking_send(RawLine {
-                            source: source.clone(),
-                            byte_offset: frag.byte_offset,
-                            raw: frag.raw,
-                        })
-                        .is_err()
-                    {
-                        tracing::debug!("tail: channel closed, exiting");
-                        return Ok(());
-                    }
-                    new_lines += 1;
+            };
+            for frag in splitter.feed(&buf[..n]) {
+                if tx
+                    .blocking_send(RawLine {
+                        source: source.to_string(),
+                        byte_offset: frag.byte_offset,
+                        raw: frag.raw,
+                    })
+                    .is_err()
+                {
+                    tracing::debug!("tail: channel closed, exiting");
+                    return false;
                 }
-            }
-            // Update the estimated total line count for appended lines.
-            if new_lines > 0
-                && let Some(ref progress) = progress
-            {
-                progress.increment_total_lines(new_lines);
+                new_lines += 1;
             }
         }
+        if new_lines > 0
+            && let Some(progress) = progress
+        {
+            progress.increment_total_lines(new_lines);
+        }
+        true
+    };
 
-        std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+    // Initial drain: read any bytes that arrived between the initial read
+    // and the watcher starting.
+    if !read_new_bytes(&mut file, &mut splitter, &mut buf, &tx, &source, &progress) {
+        return Ok(());
+    }
+
+    if watcher.is_some() {
+        // Event-driven loop: wait for notify events, then read new bytes.
+        // We also poll periodically as a safety net (some platforms may
+        // coalesce or drop events).
+        let poll_timeout = Duration::from_millis(POLL_INTERVAL_MS);
+        loop {
+            if tx.is_closed() {
+                tracing::debug!("tail: channel closed, exiting");
+                return Ok(());
+            }
+
+            // Wait for a notify event or timeout.
+            match notify_rx.recv_timeout(poll_timeout) {
+                Ok(Ok(_event)) => {
+                    if !read_new_bytes(&mut file, &mut splitter, &mut buf, &tx, &source, &progress) {
+                        return Ok(());
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("tail: watcher error: {e}");
+                    // Still try to read in case there are new bytes.
+                    if !read_new_bytes(&mut file, &mut splitter, &mut buf, &tx, &source, &progress) {
+                        return Ok(());
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // No event — do a quick check as a safety net.
+                    if !read_new_bytes(&mut file, &mut splitter, &mut buf, &tx, &source, &progress) {
+                        return Ok(());
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    tracing::debug!("tail: watcher disconnected, exiting");
+                    return Ok(());
+                }
+            }
+        }
+    } else {
+        // Polling fallback loop.
+        loop {
+            if tx.is_closed() {
+                tracing::debug!("tail: channel closed, exiting");
+                return Ok(());
+            }
+            if !read_new_bytes(&mut file, &mut splitter, &mut buf, &tx, &source, &progress) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        }
     }
 }
 

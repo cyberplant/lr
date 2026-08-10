@@ -175,11 +175,11 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
     let follow_indicator = if state.follow { "FOLLOW" } else { "  --  " };
 
     // File processing indicator: "Processing: X%" while head reader is
-    // running, "Loaded" when done.
+    // running, "Loaded" when done. Includes the current line rate.
     let processing_str = if state.progress.head_done() {
-        "Loaded".to_string()
+        format!("Loaded {:.0} L/s", state.stats.lines_per_sec)
     } else {
-        format!("Processing: {:.0}%", state.progress.fraction() * 100.0)
+        format!("Processing: {:.0}% {:.0} L/s", state.progress.fraction() * 100.0, state.stats.lines_per_sec)
     };
 
     // Scroll position: use the line_no of the first visible line (if any)
@@ -223,14 +223,9 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(
-            format!("{:.0} L/s", state.stats.lines_per_sec),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::raw("  |  "),
         Span::styled(sev_flags, Style::default().fg(Color::White)),
         Span::raw("  |  "),
-        Span::styled(processing_str, Style::default().fg(Color::Magenta)),
+        Span::styled(processing_str, Style::default().fg(Color::Cyan)),
         Span::raw("  |  "),
         Span::styled(pos_str, Style::default().fg(pos_color)),
     ];
