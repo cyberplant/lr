@@ -509,6 +509,9 @@ impl AppState {
             AppAction::ToggleHelp => {
                 self.message = "help overlay not implemented yet".to_string();
             }
+            AppAction::Refresh => {
+                // Handled in the TUI loop (needs terminal access).
+            }
             other => {
                 self.message = format!("TODO: handle {other:?}");
             }

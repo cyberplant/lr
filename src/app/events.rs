@@ -36,12 +36,18 @@ pub enum AppAction {
     ToggleWrap,
     ToggleLineNumbers,
     ExpandEntry,
+    Refresh,
 }
 
 pub fn map_event(key: KeyEvent) -> AppAction {
     // Ctrl+C always quits (escape hatch).
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return AppAction::Quit;
+    }
+
+    // Ctrl+L refreshes the UI (clear + redraw).
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
+        return AppAction::Refresh;
     }
 
     match key.code {
@@ -130,6 +136,14 @@ mod tests {
         assert_eq!(
             map_event(key(KeyCode::End, KeyModifiers::NONE)),
             AppAction::End
+        );
+    }
+
+    #[test]
+    fn ctrl_l_refreshes() {
+        assert_eq!(
+            map_event(key(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            AppAction::Refresh
         );
     }
 }

@@ -483,6 +483,11 @@ fn run_tui_loop(
                                 state.quit_requested = true;
                                 break;
                             }
+                            AppAction::Refresh => {
+                                terminal.clear()?;
+                                terminal.draw(|frame| crate::ui::render(frame, state))?;
+                                last_render = Instant::now();
+                            }
                             AppAction::Noop => {}
                             other => state.apply(other),
                         }

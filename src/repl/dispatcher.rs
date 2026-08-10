@@ -822,8 +822,9 @@ fn render_viewport(state: &AppState, plain: bool) -> String {
     let visible = visible_lines(state);
     let mut out = String::with_capacity(visible.len() * 80);
     for (_no, sev, raw) in visible {
+        let safe_raw = crate::ui::sanitize_for_terminal(&raw);
         if plain {
-            out.push_str(&format!("{}\n", raw));
+            out.push_str(&format!("{}\n", safe_raw));
         } else {
             let color = match sev {
                 "E" => "\x1b[31m",
@@ -833,7 +834,7 @@ fn render_viewport(state: &AppState, plain: bool) -> String {
                 "T" => "\x1b[90m",
                 _ => "\x1b[0m",
             };
-            out.push_str(&format!("{}{}\x1b[0m\n", color, raw));
+            out.push_str(&format!("{}{}\x1b[0m\n", color, safe_raw));
         }
     }
     out
@@ -866,7 +867,7 @@ fn render_lines(state: &AppState, from: u64, count: u64, _plain: bool) -> String
         let idx = line_to_index(state, i);
         match state.lines.get(idx) {
             Some(pl) => {
-                out.push_str(&format!("{}\n", pl.raw));
+                out.push_str(&format!("{}\n", crate::ui::sanitize_for_terminal(&pl.raw)));
             }
             None => break,
         }

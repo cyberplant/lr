@@ -10,6 +10,78 @@ use ratatui::Frame;
 use crate::app::state::AppState;
 use crate::plugin::Severity;
 
+/// Render a line's text with control characters shown as hex escapes.
+/// Control characters (ESC, DEL, and other C0 codes except \t) are
+/// rendered as `<XX>` in dark yellow to make them visible and prevent
+/// terminal corruption from escape sequences in log file content.
+/// Returns a vector of spans for the text portion (no line number).
+fn render_text_spans(
+    text: &str,
+    base_color: Color,
+    search: Option<&crate::search::Search>,
+    is_cursor: bool,
+) -> Vec<Span<'static>> {
+    let cursor_bg = if is_cursor { Color::Blue } else { Color::Reset };
+
+    if let Some(search) = search {
+        // When search is active, we need to handle both match highlighting
+        // and control char sanitization. Build the sanitized spans first,
+        // then apply search highlighting on top.
+        return highlight_matches(text, search, base_color, is_cursor);
+    }
+
+    // No search: build spans with control char hex escapes.
+    let mut spans = Vec::new();
+    let mut current = String::new();
+    for c in text.chars() {
+        if is_control_char(c) {
+            // Flush current text.
+            if !current.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut current),
+                    Style::default().fg(base_color).bg(cursor_bg),
+                ));
+            }
+            // Push the hex escape in a distinct color.
+            spans.push(Span::styled(
+                format!("<{:02X}>", c as u32),
+                Style::default().fg(Color::Yellow).bg(cursor_bg),
+            ));
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        spans.push(Span::styled(current, Style::default().fg(base_color).bg(cursor_bg)));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), Style::default().bg(cursor_bg)));
+    }
+    spans
+}
+
+/// Returns true if `c` is a terminal control character that should be
+/// sanitized (shown as hex) to prevent terminal corruption.
+pub fn is_control_char(c: char) -> bool {
+    let code = c as u32;
+    code == 0x1b || (code < 0x20 && code != 0x09 && code != 0x0a && code != 0x0d) || code == 0x7f
+}
+
+/// Sanitize a string for safe terminal output: replace control characters
+/// with `<XX>` hex escape representations. Used by the REPL to prevent
+/// terminal corruption when displaying log lines in non-TTY mode.
+pub fn sanitize_for_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if is_control_char(c) {
+            out.push_str(&format!("<{:02X}>", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub fn render(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
     state.terminal_height = area.height;
@@ -131,12 +203,9 @@ fn render_line(
     let cursor_bg = if is_cursor { Color::Blue } else { Color::Reset };
     let cursor_fg = if is_cursor { Color::White } else { color };
 
-    // Build the text spans, highlighting search matches if active.
-    let text_spans = if let Some(ref search) = state.search {
-        highlight_matches(&pl.raw, search, cursor_fg, is_cursor)
-    } else {
-        vec![Span::styled(pl.raw.clone(), Style::default().fg(cursor_fg).bg(cursor_bg))]
-    };
+    // Build the text spans, with control char hex escapes and search
+    // match highlighting.
+    let text_spans = render_text_spans(&pl.raw, cursor_fg, state.search.as_ref(), is_cursor);
 
     let mut spans = Vec::new();
     if show_line_no {
@@ -168,19 +237,39 @@ fn highlight_matches(text: &str, search: &crate::search::Search, base_color: Col
     let cursor_bg = if is_cursor { Color::Blue } else { Color::Reset };
     let matches = search.find_iter(text);
     if matches.is_empty() {
-        return vec![Span::styled(text.to_string(), Style::default().fg(base_color).bg(cursor_bg))];
+        // No matches — still sanitize control chars.
+        return render_text_spans(text, base_color, None, is_cursor);
     }
+
+    // Helper: push sanitized spans for a text segment with the given style.
+    let push_sanitized = |spans: &mut Vec<Span<'static>>, segment: &str, fg: Color, bg: Color| {
+        let mut current = String::new();
+        for c in segment.chars() {
+            if is_control_char(c) {
+                if !current.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut current), Style::default().fg(fg).bg(bg)));
+                }
+                spans.push(Span::styled(
+                    format!("<{:02X}>", c as u32),
+                    Style::default().fg(Color::Yellow).bg(bg),
+                ));
+            } else {
+                current.push(c);
+            }
+        }
+        if !current.is_empty() {
+            spans.push(Span::styled(current, Style::default().fg(fg).bg(bg)));
+        }
+    };
 
     let mut spans = Vec::with_capacity(matches.len() * 2 + 1);
     let mut last_end = 0;
     for (start, end) in matches {
         if start > last_end {
-            spans.push(Span::styled(
-                text[last_end..start].to_string(),
-                Style::default().fg(base_color).bg(cursor_bg),
-            ));
+            push_sanitized(&mut spans, &text[last_end..start], base_color, cursor_bg);
         }
         // Search match highlighting takes priority over cursor bg.
+        // Match text is shown as-is (user typed the pattern).
         spans.push(Span::styled(
             text[start..end].to_string(),
             Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
@@ -188,10 +277,7 @@ fn highlight_matches(text: &str, search: &crate::search::Search, base_color: Col
         last_end = end;
     }
     if last_end < text.len() {
-        spans.push(Span::styled(
-            text[last_end..].to_string(),
-            Style::default().fg(base_color).bg(cursor_bg),
-        ));
+        push_sanitized(&mut spans, &text[last_end..], base_color, cursor_bg);
     }
     spans
 }
@@ -326,4 +412,30 @@ fn render_command_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout
         }
     };
     frame.render_widget(Paragraph::new(line), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_escapes_control_chars() {
+        assert_eq!(sanitize_for_terminal("hello"), "hello");
+        assert_eq!(sanitize_for_terminal("\x1b[31mred\x1b[0m"), "<1B>[31mred<1B>[0m");
+        assert_eq!(sanitize_for_terminal("a\x00b"), "a<00>b");
+        assert_eq!(sanitize_for_terminal("a\x7fb"), "a<7F>b");
+    }
+
+    #[test]
+    fn sanitize_preserves_tab_and_newline() {
+        assert_eq!(sanitize_for_terminal("a\tb"), "a\tb");
+        assert_eq!(sanitize_for_terminal("a\nb"), "a\nb");
+        assert_eq!(sanitize_for_terminal("a\rb"), "a\rb");
+    }
+
+    #[test]
+    fn sanitize_preserves_unicode() {
+        assert_eq!(sanitize_for_terminal("hello — world"), "hello — world");
+        assert_eq!(sanitize_for_terminal("日本語"), "日本語");
+    }
 }

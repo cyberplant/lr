@@ -181,13 +181,13 @@ fn parse_syslog_date(s: &str) -> Option<i64> {
     if s_trimmed.len() < 15 {
         return None;
     }
-    let month_str = &s_trimmed[..3];
+    let month_str = std::str::from_utf8(&s_trimmed.as_bytes()[..3]).ok()?;
     let month_idx = months.iter().position(|m| *m == month_str)?;
     let month = (month_idx + 1) as i32;
 
     // "Nov 15 12:30:45" — day may be space-padded
     // After "Nov" there's a space, then day (1 or 2 digits), then space
-    let rest = &s_trimmed[3..].trim_start();
+    let rest = std::str::from_utf8(&s_trimmed.as_bytes()[3..]).ok()?.trim_start();
     let day_end = rest.find(' ').unwrap_or(rest.len());
     let day: i32 = rest[..day_end].trim().parse().ok()?;
 
@@ -218,11 +218,13 @@ fn parse_syslog_date(s: &str) -> Option<i64> {
 }
 
 /// Parse `len` digits from `s` starting at `offset`. Returns the integer.
+/// Uses byte slicing to avoid panicking on multi-byte UTF-8 boundaries.
 fn parse_digits(s: &str, offset: usize, len: usize) -> Option<i32> {
-    if offset + len > s.len() {
+    let b = s.as_bytes();
+    if offset + len > b.len() {
         return None;
     }
-    let sub = &s[offset..offset + len];
+    let sub = std::str::from_utf8(&b[offset..offset + len]).ok()?;
     sub.parse().ok()
 }
 
