@@ -249,10 +249,14 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
         }
         Command::Stats => {
             let state = repl.state.lock().await;
-            let total = if state.progress.lines_estimated() {
-                state.progress.estimated_total_lines()
-            } else {
+            let count_is_exact = state.progress.head_done()
+                || !state.progress.lines_estimated()
+                || (state.progress.estimated_total_lines() > 0
+                    && state.lines.len() as u64 >= state.progress.estimated_total_lines());
+            let total = if count_is_exact {
                 state.lines.len() as u64
+            } else {
+                state.progress.estimated_total_lines()
             };
             let current_line = if state.lines.is_empty() {
                 0
@@ -260,10 +264,12 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
                 let idx = state.cursor.min(state.lines.len() - 1);
                 state.lines[idx].line_no
             };
+            let est_suffix = if count_is_exact { "" } else { " (est!)" };
             DispatchResult::ok(format!(
-                "lines: {}/{}\nlines/s: {:.1}\nfollow: {}\ncursor: {}\nscroll: {}\n",
+                "lines: {}/{}{}\nlines/s: {:.1}\nfollow: {}\ncursor: {}\nscroll: {}\n",
                 current_line,
                 total,
+                est_suffix,
                 state.stats.lines_per_sec,
                 state.follow,
                 state.cursor,
@@ -374,10 +380,14 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
         }
         Command::Stats => {
             let state = repl.state.lock().await;
-            let total = if state.progress.lines_estimated() {
-                state.progress.estimated_total_lines()
-            } else {
+            let count_is_exact = state.progress.head_done()
+                || !state.progress.lines_estimated()
+                || (state.progress.estimated_total_lines() > 0
+                    && state.lines.len() as u64 >= state.progress.estimated_total_lines());
+            let total = if count_is_exact {
                 state.lines.len() as u64
+            } else {
+                state.progress.estimated_total_lines()
             };
             let current_line = if state.lines.is_empty() {
                 0
@@ -390,6 +400,7 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
                     "ok": true,
                     "current_line": current_line,
                     "total_lines": total,
+                    "estimated": !count_is_exact,
                     "lines_per_sec": state.stats.lines_per_sec,
                     "follow": state.follow,
                     "cursor": state.cursor,

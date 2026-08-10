@@ -352,8 +352,9 @@ impl AppState {
     /// Number of visible rows available for log lines (excluding status and
     /// command bars).
     pub fn visible_height(&self) -> usize {
-        // terminal_height - 2 (status bar + command bar), minimum 1.
-        (self.terminal_height as usize).saturating_sub(2).max(1)
+        // terminal_height - 2 (status bar + command bar) - 2 (log view top
+        // and bottom borders), minimum 1.
+        (self.terminal_height as usize).saturating_sub(4).max(1)
     }
 
     /// Maximum scroll offset that keeps the last line visible.

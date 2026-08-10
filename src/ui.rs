@@ -64,6 +64,8 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
     let visible_height = state.visible_height();
     let scroll = state.scroll.min(state.max_scroll());
     let cursor_idx = state.cursor.min(state.lines.len().saturating_sub(1));
+    // Inner width of the log view (excluding left and right borders).
+    let inner_width = area.width.saturating_sub(2) as usize;
 
     // Build visible lines, filtering by severity visibility and filter expr.
     let mut lines_rendered: Vec<Line> = Vec::with_capacity(visible_height);
@@ -85,7 +87,7 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
             continue;
         }
 
-        lines_rendered.push(render_line(pl, area.width as usize, state.show_line_numbers, state, is_cursor));
+        lines_rendered.push(render_line(pl, inner_width, state.show_line_numbers, state, is_cursor));
     }
 
     // If we filtered out lines and haven't filled the view, keep going.
@@ -101,7 +103,7 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
         if !state.passes_filter(pl) {
             continue;
         }
-        lines_rendered.push(render_line(pl, area.width as usize, state.show_line_numbers, state, is_cursor));
+        lines_rendered.push(render_line(pl, inner_width, state.show_line_numbers, state, is_cursor));
     }
 
     let block = Block::default().borders(Borders::ALL).title(title);
@@ -111,7 +113,7 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
 
 fn render_line(
     pl: &crate::pipeline::parser::ParsedLine,
-    _width: usize,
+    inner_width: usize,
     show_line_no: bool,
     state: &AppState,
     is_cursor: bool,
@@ -136,16 +138,29 @@ fn render_line(
         vec![Span::styled(pl.raw.clone(), Style::default().fg(cursor_fg).bg(cursor_bg))]
     };
 
+    let mut spans = Vec::new();
     if show_line_no {
-        let mut spans = vec![Span::styled(
+        spans.push(Span::styled(
             format!("{:>6} ", pl.line_no),
             Style::default().fg(Color::DarkGray).bg(cursor_bg),
-        )];
-        spans.extend(text_spans);
-        Line::from(spans)
-    } else {
-        Line::from(text_spans)
+        ));
     }
+    spans.extend(text_spans);
+
+    // Pad the cursor line to fill the full inner width with the cursor
+    // background color, so the highlight bar spans the entire line.
+    if is_cursor {
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let pad = inner_width.saturating_sub(used);
+        if pad > 0 {
+            spans.push(Span::styled(
+                " ".repeat(pad),
+                Style::default().bg(cursor_bg),
+            ));
+        }
+    }
+
+    Line::from(spans)
 }
 
 /// Split text into spans, highlighting regex matches in black-on-yellow.
@@ -193,20 +208,27 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
     };
 
     // Position: show the cursor line number and total.
+    // The count is "estimated" only while the head reader is still running
+    // AND we haven't yet loaded as many lines as the estimate. Once we have
+    // all lines loaded, the count is exact regardless of the estimated flag.
+    let count_is_exact = state.progress.head_done()
+        || !state.progress.lines_estimated()
+        || (state.progress.estimated_total_lines() > 0
+            && state.lines.len() as u64 >= state.progress.estimated_total_lines());
     let (pos_str, pos_color) = if state.lines.is_empty() {
         ("0/0".to_string(), Color::White)
     } else {
         let cursor_line = &state.lines[state.cursor.min(state.lines.len() - 1)];
-        let total = if state.progress.lines_estimated() {
-            state.progress.estimated_total_lines()
-        } else {
+        let total = if count_is_exact {
             state.lines.len() as u64
+        } else {
+            state.progress.estimated_total_lines()
         };
         let current = cursor_line.line_no;
-        if state.progress.lines_estimated() {
-            (format!("{}/{} (est!)", current, total), Color::Yellow)
-        } else {
+        if count_is_exact {
             (format!("{}/{}", current, total), Color::White)
+        } else {
+            (format!("{}/{} (est!)", current, total), Color::Yellow)
         }
     };
 
