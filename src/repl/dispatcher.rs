@@ -123,6 +123,7 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
             // Convert absolute line number to vector index using binary
             // search (line numbers may have a gap between head and tail).
             let target = line_to_index(&state, line);
+            state.cursor = target;
             state.scroll = target.min(state.max_scroll());
             state.follow = false;
             DispatchResult::ok(format!("at line {}\n", line))
@@ -130,7 +131,9 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
         Command::Page { n } => {
             let mut state = repl.state.lock().await;
             let vh = state.visible_height();
-            state.scroll = (n as usize * vh).min(state.max_scroll());
+            let target = (n as usize * vh).min(state.max_scroll());
+            state.cursor = target;
+            state.scroll = target;
             state.follow = false;
             DispatchResult::ok(format!("at page {}\n", n))
         }
@@ -249,20 +252,21 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
             let total = if state.progress.lines_estimated() {
                 state.progress.estimated_total_lines()
             } else {
-                state.stats.total_lines as u64
+                state.lines.len() as u64
             };
             let current_line = if state.lines.is_empty() {
                 0
             } else {
-                let idx = state.scroll.min(state.lines.len() - 1);
+                let idx = state.cursor.min(state.lines.len() - 1);
                 state.lines[idx].line_no
             };
             DispatchResult::ok(format!(
-                "lines: {}/{}\nlines/s: {:.1}\nfollow: {}\nscroll: {}\n",
+                "lines: {}/{}\nlines/s: {:.1}\nfollow: {}\ncursor: {}\nscroll: {}\n",
                 current_line,
                 total,
                 state.stats.lines_per_sec,
                 state.follow,
+                state.cursor,
                 state.scroll,
             ))
         }
@@ -370,12 +374,25 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
         }
         Command::Stats => {
             let state = repl.state.lock().await;
+            let total = if state.progress.lines_estimated() {
+                state.progress.estimated_total_lines()
+            } else {
+                state.lines.len() as u64
+            };
+            let current_line = if state.lines.is_empty() {
+                0
+            } else {
+                let idx = state.cursor.min(state.lines.len() - 1);
+                state.lines[idx].line_no
+            };
             DispatchResult::ok(
                 serde_json::json!({
                     "ok": true,
-                    "lines": state.stats.total_lines,
+                    "current_line": current_line,
+                    "total_lines": total,
                     "lines_per_sec": state.stats.lines_per_sec,
                     "follow": state.follow,
+                    "cursor": state.cursor,
                     "scroll": state.scroll,
                 })
                 .to_string(),
@@ -384,6 +401,7 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
         Command::Goto { line } => {
             let mut state = repl.state.lock().await;
             let target = line_to_index(&state, line);
+            state.cursor = target;
             state.scroll = target.min(state.max_scroll());
             state.follow = false;
             DispatchResult::ok(r#"{"ok":true}"#.into())
@@ -391,7 +409,9 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
         Command::Page { n } => {
             let mut state = repl.state.lock().await;
             let vh = state.visible_height();
-            state.scroll = (n as usize * vh).min(state.max_scroll());
+            let target = (n as usize * vh).min(state.max_scroll());
+            state.cursor = target;
+            state.scroll = target;
             state.follow = false;
             DispatchResult::ok(r#"{"ok":true}"#.into())
         }

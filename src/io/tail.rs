@@ -127,11 +127,14 @@ pub fn tail_reader_with_initial(
             let bytes_in_chunk = read_so_far;
             if bytes_in_chunk > 0 && lines_in_chunk > 0 {
                 let avg_line_size = bytes_in_chunk as f64 / lines_in_chunk as f64;
+                // Extrapolate: total lines ≈ file_size / avg_line_size.
+                // This already accounts for the chunk we read, so we do NOT
+                // add lines_in_chunk (that would double-count).
                 let estimated_total = (start_offset as f64 / avg_line_size).round() as u64;
-                progress.set_estimated_total_lines(estimated_total + lines_in_chunk);
+                progress.set_estimated_total_lines(estimated_total);
                 tracing::debug!(
                     "tail: estimated {} total lines (avg line size: {:.1} bytes, {} lines in {} bytes)",
-                    estimated_total + lines_in_chunk,
+                    estimated_total,
                     avg_line_size,
                     lines_in_chunk,
                     bytes_in_chunk

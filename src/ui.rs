@@ -63,12 +63,14 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
 
     let visible_height = state.visible_height();
     let scroll = state.scroll.min(state.max_scroll());
+    let cursor_idx = state.cursor.min(state.lines.len().saturating_sub(1));
 
     // Build visible lines, filtering by severity visibility and filter expr.
     let mut lines_rendered: Vec<Line> = Vec::with_capacity(visible_height);
     let mut idx = scroll;
     while lines_rendered.len() < visible_height && idx < state.lines.len() {
         let pl = &state.lines[idx];
+        let is_cursor = idx == cursor_idx;
         idx += 1;
 
         // Skip lines with hidden severity.
@@ -83,12 +85,13 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
             continue;
         }
 
-        lines_rendered.push(render_line(pl, area.width as usize, state.show_line_numbers, state));
+        lines_rendered.push(render_line(pl, area.width as usize, state.show_line_numbers, state, is_cursor));
     }
 
     // If we filtered out lines and haven't filled the view, keep going.
     while lines_rendered.len() < visible_height && idx < state.lines.len() {
         let pl = &state.lines[idx];
+        let is_cursor = idx == cursor_idx;
         idx += 1;
         if let Some(sev) = pl.severity
             && !state.severity_visible.is_visible(sev)
@@ -98,7 +101,7 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
         if !state.passes_filter(pl) {
             continue;
         }
-        lines_rendered.push(render_line(pl, area.width as usize, state.show_line_numbers, state));
+        lines_rendered.push(render_line(pl, area.width as usize, state.show_line_numbers, state, is_cursor));
     }
 
     let block = Block::default().borders(Borders::ALL).title(title);
@@ -111,6 +114,7 @@ fn render_line(
     _width: usize,
     show_line_no: bool,
     state: &AppState,
+    is_cursor: bool,
 ) -> Line<'static> {
     let color = match pl.severity {
         Some(Severity::Error) => Color::Red,
@@ -121,17 +125,21 @@ fn render_line(
         None => Color::Reset,
     };
 
+    // Cursor line: blue background, white text.
+    let cursor_bg = if is_cursor { Color::Blue } else { Color::Reset };
+    let cursor_fg = if is_cursor { Color::White } else { color };
+
     // Build the text spans, highlighting search matches if active.
     let text_spans = if let Some(ref search) = state.search {
-        highlight_matches(&pl.raw, search, color)
+        highlight_matches(&pl.raw, search, cursor_fg, is_cursor)
     } else {
-        vec![Span::styled(pl.raw.clone(), Style::default().fg(color))]
+        vec![Span::styled(pl.raw.clone(), Style::default().fg(cursor_fg).bg(cursor_bg))]
     };
 
     if show_line_no {
         let mut spans = vec![Span::styled(
             format!("{:>6} ", pl.line_no),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::DarkGray).bg(cursor_bg),
         )];
         spans.extend(text_spans);
         Line::from(spans)
@@ -141,10 +149,11 @@ fn render_line(
 }
 
 /// Split text into spans, highlighting regex matches in black-on-yellow.
-fn highlight_matches(text: &str, search: &crate::search::Search, base_color: Color) -> Vec<Span<'static>> {
+fn highlight_matches(text: &str, search: &crate::search::Search, base_color: Color, is_cursor: bool) -> Vec<Span<'static>> {
+    let cursor_bg = if is_cursor { Color::Blue } else { Color::Reset };
     let matches = search.find_iter(text);
     if matches.is_empty() {
-        return vec![Span::styled(text.to_string(), Style::default().fg(base_color))];
+        return vec![Span::styled(text.to_string(), Style::default().fg(base_color).bg(cursor_bg))];
     }
 
     let mut spans = Vec::with_capacity(matches.len() * 2 + 1);
@@ -153,9 +162,10 @@ fn highlight_matches(text: &str, search: &crate::search::Search, base_color: Col
         if start > last_end {
             spans.push(Span::styled(
                 text[last_end..start].to_string(),
-                Style::default().fg(base_color),
+                Style::default().fg(base_color).bg(cursor_bg),
             ));
         }
+        // Search match highlighting takes priority over cursor bg.
         spans.push(Span::styled(
             text[start..end].to_string(),
             Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
@@ -165,7 +175,7 @@ fn highlight_matches(text: &str, search: &crate::search::Search, base_color: Col
     if last_end < text.len() {
         spans.push(Span::styled(
             text[last_end..].to_string(),
-            Style::default().fg(base_color),
+            Style::default().fg(base_color).bg(cursor_bg),
         ));
     }
     spans
@@ -182,18 +192,17 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
         format!("Processing: {:.0}% {:.0} L/s", state.progress.fraction() * 100.0, state.stats.lines_per_sec)
     };
 
-    // Scroll position: use the line_no of the first visible line (if any)
-    // and the estimated/exact total. Show "(est!)" suffix when estimated.
+    // Position: show the cursor line number and total.
     let (pos_str, pos_color) = if state.lines.is_empty() {
         ("0/0".to_string(), Color::White)
     } else {
-        let first_visible = &state.lines[state.scroll.min(state.lines.len() - 1)];
+        let cursor_line = &state.lines[state.cursor.min(state.lines.len() - 1)];
         let total = if state.progress.lines_estimated() {
             state.progress.estimated_total_lines()
         } else {
             state.lines.len() as u64
         };
-        let current = first_visible.line_no;
+        let current = cursor_line.line_no;
         if state.progress.lines_estimated() {
             (format!("{}/{} (est!)", current, total), Color::Yellow)
         } else {

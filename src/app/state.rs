@@ -123,6 +123,9 @@ pub struct AppState {
     pub lines: Vec<ParsedLine>,
     /// Index of the first visible line (virtual scroll offset).
     pub scroll: usize,
+    /// Index of the cursor line (the highlighted "current" line).
+    /// The scroll adjusts to keep the cursor visible.
+    pub cursor: usize,
     /// When true, auto-scroll to bottom as new lines arrive.
     pub follow: bool,
     /// Line wrapping toggle (not yet implemented in renderer).
@@ -207,6 +210,7 @@ impl AppState {
             quit_requested: false,
             lines: Vec::new(),
             scroll: 0,
+            cursor: 0,
             follow, // head mode by default, follow only with -f
             wrap: false,
             show_line_numbers: false,
@@ -370,6 +374,34 @@ impl AppState {
         }
     }
 
+    /// Clamp cursor to valid range.
+    fn clamp_cursor(&mut self) {
+        if self.lines.is_empty() {
+            self.cursor = 0;
+        } else if self.cursor >= self.lines.len() {
+            self.cursor = self.lines.len() - 1;
+        }
+    }
+
+    /// Ensure the cursor is visible within the current scroll window.
+    /// If the cursor is above the visible area, scroll up to show it.
+    /// If below, scroll down to show it (preferring cursor at the bottom
+    /// of the view when scrolling down).
+    fn ensure_cursor_visible(&mut self) {
+        if self.lines.is_empty() {
+            return;
+        }
+        let vh = self.visible_height();
+        if self.cursor < self.scroll {
+            // Cursor is above the visible area — scroll up to show it.
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll + vh {
+            // Cursor is below the visible area — scroll down.
+            self.scroll = self.cursor.saturating_sub(vh - 1);
+            self.clamp_scroll();
+        }
+    }
+
     pub fn apply(&mut self, action: AppAction) {
         // In search/command input mode, most actions are handled by the
         // input handler. Only Quit and the input-specific actions apply.
@@ -398,34 +430,53 @@ impl AppState {
             AppAction::Quit => self.quit_requested = true,
             AppAction::Noop => {}
             AppAction::ScrollDown => {
+                // Move cursor down by one.
                 self.follow = false;
-                self.scroll = self.scroll.saturating_add(1);
-                self.clamp_scroll();
+                self.cursor = self.cursor.saturating_add(1);
+                self.clamp_cursor();
+                self.ensure_cursor_visible();
             }
             AppAction::ScrollUp => {
+                // Move cursor up by one.
                 self.follow = false;
-                self.scroll = self.scroll.saturating_sub(1);
+                self.cursor = self.cursor.saturating_sub(1);
+                self.ensure_cursor_visible();
             }
             AppAction::PageDown => {
+                // Move cursor down by one page. The cursor ends up at the
+                // first line of the next page (bottom of current view + 1).
                 self.follow = false;
-                self.scroll = self.scroll.saturating_add(self.visible_height());
-                self.clamp_scroll();
+                let vh = self.visible_height();
+                self.cursor = self.cursor.saturating_add(vh);
+                self.clamp_cursor();
+                self.ensure_cursor_visible();
             }
             AppAction::PageUp => {
+                // Move cursor up by one page.
                 self.follow = false;
-                self.scroll = self.scroll.saturating_sub(self.visible_height());
+                let vh = self.visible_height();
+                self.cursor = self.cursor.saturating_sub(vh);
+                self.ensure_cursor_visible();
             }
             AppAction::Home => {
                 self.follow = false;
+                self.cursor = 0;
                 self.scroll = 0;
             }
             AppAction::End => {
                 self.follow = true;
+                self.clamp_cursor();
+                if !self.lines.is_empty() {
+                    self.cursor = self.lines.len() - 1;
+                }
                 self.scroll_to_bottom();
             }
             AppAction::ToggleFollow => {
                 self.follow = !self.follow;
                 if self.follow {
+                    if !self.lines.is_empty() {
+                        self.cursor = self.lines.len() - 1;
+                    }
                     self.scroll_to_bottom();
                 }
             }

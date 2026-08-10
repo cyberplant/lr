@@ -125,6 +125,9 @@ async fn run_repl(
                     s.lines.sort_by_key(|l| l.byte_offset);
                     renumber_lines(&mut s);
                     if s.follow {
+                        if !s.lines.is_empty() {
+                            s.cursor = s.lines.len() - 1;
+                        }
                         s.scroll_to_bottom();
                     } else if let Some(anchor) = anchor_offset {
                         let new_idx = s
@@ -410,7 +413,10 @@ fn run_tui_loop(
             // Renumber lines.
             renumber_lines(state);
             if state.follow {
-                // If following, snap to the bottom.
+                // If following, snap cursor and scroll to the bottom.
+                if !state.lines.is_empty() {
+                    state.cursor = state.lines.len() - 1;
+                }
                 state.scroll_to_bottom();
             } else if let Some(anchor) = anchor_offset {
                 // Restore scroll to the same line (by byte_offset).
