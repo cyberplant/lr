@@ -12,10 +12,94 @@ use crate::theme::Theme;
 use super::events::AppAction;
 
 /// Runtime statistics shown in the status bar.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Stats {
     pub total_lines: usize,
     pub lines_per_sec: f64,
+    /// History of lines/sec samples (one per second), newest at the end.
+    /// Capped at 1800 entries (30 minutes at 1 sample/sec).
+    pub rate_history: Vec<f64>,
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            total_lines: 0,
+            lines_per_sec: 0.0,
+            rate_history: Vec::new(),
+        }
+    }
+}
+
+/// Maximum number of rate history samples (30 minutes at 1/sec).
+const MAX_RATE_HISTORY: usize = 1800;
+
+impl Stats {
+    /// Push a new per-second rate sample into the history.
+    pub fn push_rate_sample(&mut self, rate: f64) {
+        self.rate_history.push(rate);
+        if self.rate_history.len() > MAX_RATE_HISTORY {
+            self.rate_history.remove(0);
+        }
+    }
+
+    /// Render a 5-character sparkline from the rate history.
+    /// Each character represents a bucket (average rate in that bucket).
+    /// Uses block elements: space, ▂ ▃ ▅ ▆ ▇ █ for 0, 1/4, 3/8, 5/8, 3/4, 7/8, full.
+    pub fn sparkline(&self, width: usize) -> String {
+        if self.rate_history.is_empty() || width == 0 {
+            return " ".repeat(width);
+        }
+
+        // Bucket the history into `width` segments.
+        let n = self.rate_history.len();
+        let bucket_size = n / width;
+        let buckets: Vec<f64> = if bucket_size == 0 {
+            // Fewer samples than width — pad with zeros at the front.
+            let padding = width - n;
+            let mut v = vec![0.0; padding];
+            v.extend_from_slice(&self.rate_history);
+            v
+        } else {
+            (0..width)
+                .map(|i| {
+                    let start = i * bucket_size;
+                    let end = if i == width - 1 { n } else { start + bucket_size };
+                    let slice = &self.rate_history[start..end];
+                    slice.iter().sum::<f64>() / slice.len() as f64
+                })
+                .collect()
+        };
+
+        let max_rate = buckets.iter().cloned().fold(0.0f64, f64::max).max(1.0);
+
+        let blocks = [' ', '\u{2582}', '\u{2583}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+        // 7 levels: 0, 1/4, 3/8, 5/8, 3/4, 7/8, full
+        // Map: 0 -> ' ', (0, 0.25] -> ▂, (0.25, 0.375] -> ▃, (0.375, 0.625] -> ▅,
+        //      (0.625, 0.75] -> ▆, (0.75, 0.875] -> ▇, (0.875, 1.0] -> █
+        let thresholds = [0.0, 0.25, 0.375, 0.625, 0.75, 0.875, 1.0];
+
+        buckets
+            .iter()
+            .map(|&r| {
+                let ratio = r / max_rate;
+                let mut idx = 0;
+                for (i, &t) in thresholds.iter().enumerate() {
+                    if ratio >= t {
+                        idx = i;
+                    } else {
+                        break;
+                    }
+                }
+                // idx is the last threshold we exceeded; map to blocks[idx]
+                // but if ratio is 0, idx stays 0 which maps to ' ' (space).
+                if ratio <= 0.0 {
+                    return blocks[0];
+                }
+                blocks[idx.min(blocks.len() - 1)]
+            })
+            .collect()
+    }
 }
 
 /// Input mode for the command/search bar.
@@ -623,5 +707,80 @@ mod tests {
         let f = parse_filter("/err.*/").unwrap();
         assert!(f.matches(&ParsedLine::stub("an error occurred")));
         assert!(!f.matches(&ParsedLine::stub("all good")));
+    }
+
+    #[test]
+    fn sparkline_empty_history() {
+        let stats = Stats::default();
+        let s = stats.sparkline(5);
+        assert_eq!(s, "     ");
+    }
+
+    #[test]
+    fn sparkline_all_zero() {
+        let mut stats = Stats::default();
+        for _ in 0..10 {
+            stats.push_rate_sample(0.0);
+        }
+        let s = stats.sparkline(5);
+        assert_eq!(s, "     ");
+    }
+
+    #[test]
+    fn sparkline_uniform_rate() {
+        let mut stats = Stats::default();
+        for _ in 0..10 {
+            stats.push_rate_sample(100.0);
+        }
+        let s = stats.sparkline(5);
+        // All buckets are equal and max -> all should be full block █
+        assert_eq!(s, "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}");
+    }
+
+    #[test]
+    fn sparkline_increasing_rate() {
+        let mut stats = Stats::default();
+        // 5 samples: 0, 10, 20, 30, 40 — increasing
+        stats.push_rate_sample(0.0);
+        stats.push_rate_sample(10.0);
+        stats.push_rate_sample(20.0);
+        stats.push_rate_sample(30.0);
+        stats.push_rate_sample(40.0);
+        let s = stats.sparkline(5);
+        // Max is 40. Ratios: 0, 0.25, 0.5, 0.75, 1.0
+        // 0 -> ' ', 0.25 -> ▃, 0.5 -> ▅, 0.75 -> ▆, 1.0 -> █
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars.len(), 5);
+        assert_eq!(chars[0], ' ');       // 0/40 = 0
+        assert_eq!(chars[4], '\u{2588}'); // 40/40 = 1.0 -> full
+    }
+
+    #[test]
+    fn sparkline_fewer_samples_than_width() {
+        let mut stats = Stats::default();
+        stats.push_rate_sample(50.0);
+        stats.push_rate_sample(100.0);
+        let s = stats.sparkline(5);
+        // 2 samples, width 5 -> padded with 3 zeros at front
+        // buckets: [0, 0, 0, 50, 100]
+        // max = 100, ratios: 0, 0, 0, 0.5, 1.0
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars.len(), 5);
+        assert_eq!(chars[0], ' ');       // 0
+        assert_eq!(chars[2], ' ');       // 0
+        assert_eq!(chars[4], '\u{2588}'); // 100/100 = 1.0 -> full
+    }
+
+    #[test]
+    fn sparkline_caps_at_30_minutes() {
+        let mut stats = Stats::default();
+        // Push 2000 samples (more than 1800 = 30 min)
+        for i in 0..2000 {
+            stats.push_rate_sample(i as f64);
+        }
+        // Should be capped at 1800
+        assert_eq!(stats.rate_history.len(), 1800);
+        // Oldest sample should be 200, not 0
+        assert_eq!(stats.rate_history[0], 200.0);
     }
 }

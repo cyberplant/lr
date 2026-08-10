@@ -136,6 +136,8 @@ async fn run_repl(
                 if sec_start.elapsed() >= Duration::from_secs(1) {
                     let mut s = state.lock().await;
                     s.stats.lines_per_sec = lines_this_sec as f64 / sec_start.elapsed().as_secs_f64();
+                    let rate = s.stats.lines_per_sec;
+                    s.stats.push_rate_sample(rate);
                     lines_this_sec = 0;
                     sec_start = Instant::now();
                 }
@@ -426,6 +428,7 @@ fn run_tui_loop(
         // Update lines/sec counter every second.
         if sec_start.elapsed() >= Duration::from_secs(1) {
             state.stats.lines_per_sec = lines_this_sec as f64 / sec_start.elapsed().as_secs_f64();
+            state.stats.push_rate_sample(state.stats.lines_per_sec);
             lines_this_sec = 0;
             sec_start = Instant::now();
         }

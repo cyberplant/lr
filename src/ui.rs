@@ -210,7 +210,11 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
         if state.severity_visible.trace { "T" } else { "-" },
     );
 
-    let line = Line::from(vec![
+    // Sparkline: 5-character rate trend graph.
+    let sparkline = state.stats.sparkline(5);
+
+    // Left side of the status bar.
+    let mut left_spans: Vec<Span> = vec![
         Span::styled(
             format!(" {} ", follow_indicator),
             Style::default()
@@ -229,22 +233,35 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
         Span::styled(processing_str, Style::default().fg(Color::Magenta)),
         Span::raw("  |  "),
         Span::styled(pos_str, Style::default().fg(pos_color)),
-        // Show search match count if a search is active.
-        if !state.search_matches.is_empty() {
-            Span::raw("  |  ")
-        } else {
-            Span::raw("")
-        },
-        if !state.search_matches.is_empty() {
-            Span::styled(
-                format!("match {}/{}", state.search_cursor + 1, state.search_matches.len()),
-                Style::default().fg(Color::Yellow),
-            )
-        } else {
-            Span::raw("")
-        },
-    ]);
+    ];
 
+    // Show search match count if a search is active.
+    if !state.search_matches.is_empty() {
+        left_spans.push(Span::raw("  |  "));
+        left_spans.push(Span::styled(
+            format!("match {}/{}", state.search_cursor + 1, state.search_matches.len()),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    // Right side: sparkline + rate.
+    let right_spans = vec![
+        Span::styled(sparkline, Style::default().fg(Color::Cyan)),
+        Span::raw(" "),
+    ];
+
+    // Build the line with left and right segments.
+    // Calculate the right-side width to add appropriate spacing.
+    let right_width: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+    let left_width: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    let total_width = area.width as usize;
+    let gap = total_width.saturating_sub(left_width + right_width);
+
+    let mut all_spans = left_spans;
+    all_spans.push(Span::raw(" ".repeat(gap)));
+    all_spans.extend(right_spans);
+
+    let line = Line::from(all_spans);
     let bar = Paragraph::new(line).style(Style::default().bg(Color::Blue));
     frame.render_widget(bar, area);
 }
