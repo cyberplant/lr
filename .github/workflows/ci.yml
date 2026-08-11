@@ -60,9 +60,6 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: lr-macos-arm64
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact: lr-macos-x86_64
 
     steps:
       - uses: actions/checkout@v4
