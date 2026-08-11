@@ -201,7 +201,7 @@ impl AppState {
         let message = if files.is_empty() {
             "no files given — pass paths or --stdin".to_string()
         } else {
-            format!("opened {} file(s)", files.len())
+            format!("opened {} file(s) — github.com/cyberplant/lr", files.len())
         };
         Self {
             config,

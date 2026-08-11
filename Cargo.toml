@@ -2,6 +2,13 @@
 name = "lr"
 version = "0.1.0"
 edition = "2024"
+authors = ["cyberplant"]
+license = "BSD-3-Clause"
+description = "A fast, plugin-driven terminal log reader with dual-FD streaming, SQL queries, and TUI"
+repository = "https://github.com/cyberplant/lr"
+homepage = "https://github.com/cyberplant/lr"
+keywords = ["log", "tui", "tail", "viewer", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0.104"
