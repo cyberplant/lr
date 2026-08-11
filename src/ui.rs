@@ -108,16 +108,16 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
 
 fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
     let title = if state.files.is_empty() {
-        "lr — (stdin)".to_string()
+        "LR — (stdin)".to_string()
     } else {
-        format!("lr — {}", state.files.first().map(|p| p.display().to_string()).unwrap_or_default())
+        format!("LR — {}", state.files.first().map(|p| p.display().to_string()).unwrap_or_default())
     };
 
     if state.lines.is_empty() {
         let view = Paragraph::new(vec![
             Line::from(Span::styled(
                 "LR — Log Reader",
-                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow).bg(Color::Blue),
             )),
             Line::from(""),
             Line::from(if state.files.is_empty() && state.message.contains("no files") {
@@ -128,7 +128,15 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
             Line::from(""),
             Line::from("press ? for help, q to quit"),
         ])
-        .block(Block::default().borders(Borders::ALL).title(title));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    title,
+                    Style::default().fg(Color::Yellow).bg(Color::Blue).add_modifier(Modifier::BOLD),
+                ))
+                .border_style(Style::default().fg(Color::Blue)),
+        );
         frame.render_widget(view, area);
         return;
     }
@@ -178,7 +186,13 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
         lines_rendered.push(render_line(pl, inner_width, state.show_line_numbers, state, is_cursor));
     }
 
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            title,
+            Style::default().fg(Color::Yellow).bg(Color::Blue).add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(Color::Blue));
     let paragraph = Paragraph::new(lines_rendered).block(block);
     frame.render_widget(paragraph, area);
 }
