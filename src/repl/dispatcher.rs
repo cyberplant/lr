@@ -854,6 +854,9 @@ fn visible_lines(state: &AppState) -> Vec<(u64, &'static str, String)> {
         {
             continue;
         }
+        if !state.passes_filter(pl) {
+            continue;
+        }
         out.push((pl.line_no, severity_char(pl.severity), pl.raw.clone()));
     }
     out
