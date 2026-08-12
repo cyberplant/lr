@@ -328,10 +328,13 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
         if count_is_exact {
             let base = format!("{}/{}", current, total);
             if state.filtering_active() {
-                // Show filtered count alongside total.
                 let vis = state.visible_count();
-                let rank = state.visible_rank(state.cursor.min(state.lines.len() - 1));
-                (format!("{} {}/{} (filtered)", base, rank + 1, vis), Color::White)
+                if vis == 0 {
+                    ("-- Nothing to display --".to_string(), Color::DarkGray)
+                } else {
+                    let rank = state.visible_rank(state.cursor.min(state.lines.len() - 1));
+                    (format!("{} {}/{} (filtered)", base, rank + 1, vis), Color::White)
+                }
             } else {
                 (base, Color::White)
             }

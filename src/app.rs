@@ -125,7 +125,9 @@ async fn run_repl(
                     s.lines.sort_by_key(|l| l.byte_offset);
                     renumber_lines(&mut s);
                     if s.follow {
-                        if !s.lines.is_empty() {
+                        if s.filtering_active() {
+                            s.cursor = s.prev_visible_from(s.lines.len().saturating_sub(1)).unwrap_or(0);
+                        } else if !s.lines.is_empty() {
                             s.cursor = s.lines.len() - 1;
                         }
                         s.scroll_to_bottom();
@@ -414,7 +416,11 @@ fn run_tui_loop(
             renumber_lines(state);
             if state.follow {
                 // If following, snap cursor and scroll to the bottom.
-                if !state.lines.is_empty() {
+                // When filtering is active, snap to the last visible line
+                // (not the last raw line, which may be hidden).
+                if state.filtering_active() {
+                    state.cursor = state.prev_visible_from(state.lines.len().saturating_sub(1)).unwrap_or(0);
+                } else if !state.lines.is_empty() {
                     state.cursor = state.lines.len() - 1;
                 }
                 state.scroll_to_bottom();

@@ -386,7 +386,7 @@ impl AppState {
 
     /// Find the previous visible line at or before `idx`. Returns None if
     /// there are no visible lines at or before `idx`.
-    fn prev_visible_from(&self, idx: usize) -> Option<usize> {
+    pub fn prev_visible_from(&self, idx: usize) -> Option<usize> {
         if idx >= self.lines.len() {
             return None;
         }
