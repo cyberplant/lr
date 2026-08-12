@@ -519,7 +519,7 @@ impl AppState {
 
     /// Clamp cursor to the nearest visible line. If no visible lines exist,
     /// cursor stays at 0.
-    fn clamp_cursor(&mut self) {
+    pub fn clamp_cursor(&mut self) {
         if self.lines.is_empty() {
             self.cursor = 0;
             return;
