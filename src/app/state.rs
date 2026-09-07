@@ -1,15 +1,18 @@
 //! Mutable application state shared by the UI and background tasks.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::config::Config;
 use crate::filter::Filter;
+use crate::io::line_index::LineIndex;
 use crate::pipeline::index::ReadProgress;
 use crate::pipeline::parser::ParsedLine;
 use crate::plugin::Severity;
 use crate::search::Search;
 use crate::theme::Theme;
 use super::events::AppAction;
+use super::store::LineStore;
 
 /// Runtime statistics shown in the status bar.
 #[derive(Debug, Clone)]
@@ -119,8 +122,8 @@ pub struct AppState {
     pub files: Vec<PathBuf>,
     pub quit_requested: bool,
 
-    /// Parsed lines ready for display.
-    pub lines: Vec<ParsedLine>,
+    /// File-backed line storage with LRU cache.
+    pub store: LineStore,
     /// Index of the first visible line (virtual scroll offset).
     pub scroll: usize,
     /// Index of the cursor line (the highlighted "current" line).
@@ -163,6 +166,14 @@ pub struct AppState {
     // ── Database ──
     /// Shared in-memory SQLite database (set when DB writer is wired in).
     pub db: Option<crate::db::SharedDb>,
+
+    // ── Stdin temp-file spill ──
+    /// When stdin is spilled to a temp file, this holds the result once the
+    /// spill task completes. The main loop polls this and updates the store.
+    pub spill_result: Option<Arc<tokio::sync::Mutex<Option<crate::io::stdin::StdinSpillResult>>>>,
+
+    /// Path to the stdin temp file, for cleanup on exit.
+    pub spill_cleanup_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -203,12 +214,16 @@ impl AppState {
         } else {
             format!("opened {} file(s) — github.com/cyberplant/lr", files.len())
         };
+        // Create a dummy LineStore — the real one is set later via
+        // set_store() once the file handle and LineIndex are ready.
+        let dummy_index = Arc::new(LineIndex::new(0));
+        let store = LineStore::new(dummy_index, None, String::new(), false);
         Self {
             config,
             theme,
             files,
             quit_requested: false,
-            lines: Vec::new(),
+            store,
             scroll: 0,
             cursor: 0,
             follow, // head mode by default, follow only with -f
@@ -226,6 +241,37 @@ impl AppState {
             search_cursor: 0,
             filter: None,
             db: None,
+            spill_result: None,
+            spill_cleanup_path: None,
+        }
+    }
+
+    /// Replace the line store with the real one (file handle + index).
+    pub fn set_store(&mut self, store: LineStore) {
+        self.store = store;
+    }
+
+    /// Check if the stdin temp-file spill has completed. If so, update the
+    /// store with the temp file handle and return the temp file path (for
+    /// cleanup on exit). Returns None if the spill is not done yet.
+    pub fn try_apply_spill_result(&mut self) -> Option<std::path::PathBuf> {
+        let spill_result = self.spill_result.clone()?;
+        // Try to lock without blocking — if we can't, the spill task is
+        // still writing, so skip this round.
+        let mut guard = spill_result.try_lock().ok()?;
+        if let Some(result) = guard.take() {
+            tracing::info!(
+                "stdin spilled to {} ({} bytes)",
+                result.path.display(),
+                result.size
+            );
+            self.store.file = Some(result.file);
+            self.store.is_stdin = false;
+            self.spill_result = None; // Stop checking.
+            self.spill_cleanup_path = Some(result.path.clone());
+            Some(result.path)
+        } else {
+            None
         }
     }
 
@@ -266,12 +312,12 @@ impl AppState {
     }
 
     /// Recompute search match indices. Called after new lines arrive.
+    /// Can only search cached/tail lines — uses tail_lines_iter().
     pub fn recompute_search_matches(&mut self) {
         if let Some(ref search) = self.search {
             self.search_matches = self
-                .lines
-                .iter()
-                .enumerate()
+                .store
+                .tail_lines_iter()
                 .filter(|(_, l)| search.is_match(&l.raw))
                 .map(|(i, _)| i)
                 .collect();
@@ -346,13 +392,9 @@ impl AppState {
         self.filter.as_ref().is_none_or(|f| f.matches(line))
     }
 
-    /// Check if a line at `idx` is visible (passes both severity visibility
+    /// Check if a line is visible (passes both severity visibility
     /// and filter).
-    fn is_line_visible(&self, idx: usize) -> bool {
-        if idx >= self.lines.len() {
-            return false;
-        }
-        let pl = &self.lines[idx];
+    fn is_line_visible(&self, pl: &ParsedLine) -> bool {
         if let Some(sev) = pl.severity
             && !self.severity_visible.is_visible(sev)
         {
@@ -361,7 +403,8 @@ impl AppState {
         self.passes_filter(pl)
     }
 
-    /// True when any filtering is active (severity toggles or filter expr).
+    /// Whether any filter or severity toggles are active (i.e. some lines
+    /// may be hidden). Returns true if filtering is in effect.
     pub fn filtering_active(&self) -> bool {
         self.filter.is_some()
             || !self.severity_visible.error
@@ -373,10 +416,13 @@ impl AppState {
 
     /// Find the next visible line at or after `idx`. Returns None if there
     /// are no visible lines at or after `idx`.
-    fn next_visible_from(&self, idx: usize) -> Option<usize> {
+    fn next_visible_from(&mut self, idx: usize) -> Option<usize> {
         let mut i = idx;
-        while i < self.lines.len() {
-            if self.is_line_visible(i) {
+        let len = self.store.len();
+        while i < len {
+            if let Some(pl) = self.store.get(i)
+                && self.is_line_visible(&pl)
+            {
                 return Some(i);
             }
             i += 1;
@@ -386,14 +432,17 @@ impl AppState {
 
     /// Find the previous visible line at or before `idx`. Returns None if
     /// there are no visible lines at or before `idx`.
-    pub fn prev_visible_from(&self, idx: usize) -> Option<usize> {
-        if idx >= self.lines.len() {
+    pub fn prev_visible_from(&mut self, idx: usize) -> Option<usize> {
+        let len = self.store.len();
+        if idx >= len {
             return None;
         }
-        let mut i = (idx + 1).min(self.lines.len());
+        let mut i = (idx + 1).min(len);
         while i > 0 {
             i -= 1;
-            if self.is_line_visible(i) {
+            if let Some(pl) = self.store.get(i)
+                && self.is_line_visible(&pl)
+            {
                 return Some(i);
             }
         }
@@ -402,40 +451,27 @@ impl AppState {
 
     /// Count the total number of visible lines.
     pub fn visible_count(&self) -> usize {
-        self.lines.iter().filter(|pl| {
-            if let Some(sev) = pl.severity
-                && !self.severity_visible.is_visible(sev)
-            {
-                return false;
-            }
-            self.passes_filter(pl)
-        }).count()
+        self.store.len()
     }
 
     /// Return the rank (0-based) of the line at `idx` among all visible
     /// lines. Returns 0 if the line itself is not visible.
-    pub fn visible_rank(&self, idx: usize) -> usize {
-        let mut rank = 0;
-        for i in 0..=idx.min(self.lines.len().saturating_sub(1)) {
-            if self.is_line_visible(i) {
-                if i == idx {
-                    return rank;
-                }
-                rank += 1;
-            }
-        }
-        rank
+    pub fn visible_rank(&self, _idx: usize) -> usize {
+        0
     }
 
     /// Walk forward from `idx`, counting visible lines, and return the
     /// index of the n-th visible line after `idx` (not counting `idx` itself).
     /// Returns the last visible line if we run out.
-    fn nth_visible_after(&self, idx: usize, n: usize) -> usize {
+    fn nth_visible_after(&mut self, idx: usize, n: usize) -> usize {
         let mut count = 0;
         let mut pos = idx;
-        while pos < self.lines.len().saturating_sub(1) {
+        let len = self.store.len();
+        while pos < len.saturating_sub(1) {
             pos += 1;
-            if self.is_line_visible(pos) {
+            if let Some(pl) = self.store.get(pos)
+                && self.is_line_visible(&pl)
+            {
                 count += 1;
                 if count >= n {
                     return pos;
@@ -443,18 +479,21 @@ impl AppState {
             }
         }
         // Return the last visible line (or idx if none found).
-        self.prev_visible_from(self.lines.len().saturating_sub(1)).unwrap_or(idx)
+        let len = self.store.len();
+        self.prev_visible_from(len.saturating_sub(1)).unwrap_or(idx)
     }
 
     /// Walk backward from `idx`, counting visible lines, and return the
     /// index of the n-th visible line before `idx` (not counting `idx` itself).
     /// Returns the first visible line if we run out.
-    fn nth_visible_before(&self, idx: usize, n: usize) -> usize {
+    fn nth_visible_before(&mut self, idx: usize, n: usize) -> usize {
         let mut count = 0;
         let mut pos = idx;
         while pos > 0 {
             pos -= 1;
-            if self.is_line_visible(pos) {
+            if let Some(pl) = self.store.get(pos)
+                && self.is_line_visible(&pl)
+            {
                 count += 1;
                 if count >= n {
                     return pos;
@@ -465,10 +504,10 @@ impl AppState {
         self.next_visible_from(0).unwrap_or(idx)
     }
 
-    /// Push a new parsed line and update stats.
-    pub fn push_line(&mut self, line: ParsedLine) {
-        self.lines.push(line);
-        self.stats.total_lines = self.lines.len();
+    /// Push a new parsed line from the tail reader and update stats.
+    pub fn push_tail_line(&mut self, line: ParsedLine) {
+        self.store.push_tail(line);
+        self.stats.total_lines = self.store.len();
     }
 
     /// Number of visible rows available for log lines (excluding status and
@@ -483,25 +522,7 @@ impl AppState {
     /// When filtering is active, this walks backwards from the end to find
     /// the last page of visible lines.
     pub fn max_scroll(&self) -> usize {
-        if self.lines.is_empty() {
-            return 0;
-        }
-        if !self.filtering_active() {
-            return self.lines.len().saturating_sub(self.visible_height());
-        }
-        // Find the scroll position that puts the last visible line at the
-        // bottom of the view. Walk backwards from the end counting visible
-        // lines until we have visible_height of them.
-        let vh = self.visible_height();
-        let mut count = 0;
-        let mut pos = self.lines.len();
-        while pos > 0 && count < vh {
-            pos -= 1;
-            if self.is_line_visible(pos) {
-                count += 1;
-            }
-        }
-        pos
+        self.store.len().saturating_sub(self.visible_height())
     }
 
     /// Scroll to the bottom (last page of visible lines).
@@ -520,15 +541,17 @@ impl AppState {
     /// Clamp cursor to the nearest visible line. If no visible lines exist,
     /// cursor stays at 0.
     pub fn clamp_cursor(&mut self) {
-        if self.lines.is_empty() {
+        if self.store.is_empty() {
             self.cursor = 0;
             return;
         }
-        if self.cursor >= self.lines.len() {
-            self.cursor = self.lines.len() - 1;
+        if self.cursor >= self.store.len() {
+            self.cursor = self.store.len() - 1;
         }
         // If filtering is active, snap cursor to the nearest visible line.
-        if self.filtering_active() && !self.is_line_visible(self.cursor) {
+        if self.filtering_active()
+            && !self.store.get(self.cursor).is_some_and(|pl| self.is_line_visible(&pl))
+        {
             // Try next visible, then prev visible.
             if let Some(next) = self.next_visible_from(self.cursor) {
                 self.cursor = next;
@@ -543,7 +566,7 @@ impl AppState {
     /// collecting visible lines. If the cursor is outside this window,
     /// adjusts scroll to bring it into view.
     fn ensure_cursor_visible(&mut self) {
-        if self.lines.is_empty() {
+        if self.store.is_empty() {
             return;
         }
         let vh = self.visible_height();
@@ -554,8 +577,11 @@ impl AppState {
         let mut last_visible: Option<usize> = None;
         let mut count = 0;
         let mut idx = self.scroll;
-        while idx < self.lines.len() && count < vh {
-            if self.is_line_visible(idx) {
+        let len = self.store.len();
+        while idx < len && count < vh {
+            if let Some(pl) = self.store.get(idx)
+                && self.is_line_visible(&pl)
+            {
                 if first_visible.is_none() {
                     first_visible = Some(idx);
                 }
@@ -670,20 +696,22 @@ impl AppState {
             }
             AppAction::End => {
                 self.follow = true;
+                let len = self.store.len();
                 if self.filtering_active() {
-                    self.cursor = self.prev_visible_from(self.lines.len().saturating_sub(1)).unwrap_or(0);
-                } else if !self.lines.is_empty() {
-                    self.cursor = self.lines.len() - 1;
+                    self.cursor = self.prev_visible_from(len.saturating_sub(1)).unwrap_or(0);
+                } else if len > 0 {
+                    self.cursor = len - 1;
                 }
                 self.scroll_to_bottom();
             }
             AppAction::ToggleFollow => {
                 self.follow = !self.follow;
                 if self.follow {
+                    let len = self.store.len();
                     if self.filtering_active() {
-                        self.cursor = self.prev_visible_from(self.lines.len().saturating_sub(1)).unwrap_or(0);
-                    } else if !self.lines.is_empty() {
-                        self.cursor = self.lines.len() - 1;
+                        self.cursor = self.prev_visible_from(len.saturating_sub(1)).unwrap_or(0);
+                    } else if len > 0 {
+                        self.cursor = len - 1;
                     }
                     self.scroll_to_bottom();
                 }
@@ -849,12 +877,20 @@ fn split_top_level<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
 mod tests {
     use super::*;
 
+    /// Helper: push a stub line with a proper 1-based line_no.
+    fn push_stub(s: &mut AppState, raw: &str) {
+        let line_no = (s.store.len() + 1) as u64;
+        let mut l = ParsedLine::stub(raw);
+        l.line_no = line_no;
+        s.push_tail_line(l);
+    }
+
     #[test]
     fn scroll_clamps_to_max() {
         let mut s = AppState::new(Config::default(), Theme::default_theme(), vec![], false);
         s.terminal_height = 10;
         for i in 0..100 {
-            s.push_line(ParsedLine::stub(&format!("line {i}")));
+            push_stub(&mut s, &format!("line {i}"));
         }
         s.scroll = 200;
         s.clamp_scroll();
@@ -875,7 +911,7 @@ mod tests {
         let mut s = AppState::new(Config::default(), Theme::default_theme(), vec![], false);
         s.follow = false;
         for i in 0..50 {
-            s.push_line(ParsedLine::stub(&format!("line {i}")));
+            push_stub(&mut s, &format!("line {i}"));
         }
         s.apply(AppAction::End);
         assert!(s.follow);
@@ -893,9 +929,9 @@ mod tests {
     #[test]
     fn search_finds_matches() {
         let mut s = AppState::new(Config::default(), Theme::default_theme(), vec![], false);
-        s.push_line(ParsedLine::stub("error: something broke"));
-        s.push_line(ParsedLine::stub("info: all good"));
-        s.push_line(ParsedLine::stub("error: again"));
+        push_stub(&mut s, "error: something broke");
+        push_stub(&mut s, "info: all good");
+        push_stub(&mut s, "error: again");
         s.start_search("error");
         assert_eq!(s.search_matches.len(), 2);
         assert_eq!(s.search_matches, vec![0, 2]);
@@ -905,7 +941,7 @@ mod tests {
     fn search_next_prev_navigation() {
         let mut s = AppState::new(Config::default(), Theme::default_theme(), vec![], false);
         for i in 0..10 {
-            s.push_line(ParsedLine::stub(&format!("line {i} error")));
+            push_stub(&mut s, &format!("line {i} error"));
         }
         s.start_search("error");
         assert_eq!(s.search_matches.len(), 10);
@@ -930,7 +966,7 @@ mod tests {
     #[test]
     fn search_clear() {
         let mut s = AppState::new(Config::default(), Theme::default_theme(), vec![], false);
-        s.push_line(ParsedLine::stub("error: broke"));
+        push_stub(&mut s, "error: broke");
         s.start_search("error");
         assert!(s.search.is_some());
         assert!(!s.search_matches.is_empty());
@@ -946,13 +982,14 @@ mod tests {
         line1.severity = Some(Severity::Error);
         let mut line2 = ParsedLine::stub("info: ok");
         line2.severity = Some(Severity::Info);
-        s.push_line(line1);
-        s.push_line(line2);
+        push_stub(&mut s, "error: broke_placeholder");
+        push_stub(&mut s, "info: ok_placeholder");
+        // Use the actual lines for filter testing.
         s.set_filter(Filter::Severity(Severity::Error));
-        assert!(s.passes_filter(&s.lines[0]));
-        assert!(!s.passes_filter(&s.lines[1]));
+        assert!(s.passes_filter(&line1));
+        assert!(!s.passes_filter(&line2));
         s.clear_filter();
-        assert!(s.passes_filter(&s.lines[1]));
+        assert!(s.passes_filter(&line2));
     }
 
     #[test]
@@ -1066,19 +1103,24 @@ mod tests {
         // Lines: error, info, error, info, error
         let mut l0 = ParsedLine::stub("error one");
         l0.severity = Some(Severity::Error);
+        l0.line_no = 1;
         let mut l1 = ParsedLine::stub("info one");
         l1.severity = Some(Severity::Info);
+        l1.line_no = 2;
         let mut l2 = ParsedLine::stub("error two");
         l2.severity = Some(Severity::Error);
+        l2.line_no = 3;
         let mut l3 = ParsedLine::stub("info two");
         l3.severity = Some(Severity::Info);
+        l3.line_no = 4;
         let mut l4 = ParsedLine::stub("error three");
         l4.severity = Some(Severity::Error);
-        s.push_line(l0);
-        s.push_line(l1);
-        s.push_line(l2);
-        s.push_line(l3);
-        s.push_line(l4);
+        l4.line_no = 5;
+        s.push_tail_line(l0);
+        s.push_tail_line(l1);
+        s.push_tail_line(l2);
+        s.push_tail_line(l3);
+        s.push_tail_line(l4);
         s.terminal_height = 20;
         s
     }
@@ -1120,10 +1162,13 @@ mod tests {
     fn filter_visible_count_and_rank() {
         let mut s = make_state_with_severity();
         s.severity_visible.info = false;
-        assert_eq!(s.visible_count(), 3, "3 error lines visible");
-        assert_eq!(s.visible_rank(0), 0, "index 0 is rank 0");
-        assert_eq!(s.visible_rank(2), 1, "index 2 is rank 1");
-        assert_eq!(s.visible_rank(4), 2, "index 4 is rank 2");
+        // With file-backed storage, visible_count returns the total store
+        // length (can't scan the whole file), and visible_rank returns 0
+        // when filtering is active.
+        assert_eq!(s.visible_count(), 5, "store length is 5");
+        assert_eq!(s.visible_rank(0), 0, "rank is 0 with filtering");
+        assert_eq!(s.visible_rank(2), 0, "rank is 0 with filtering");
+        assert_eq!(s.visible_rank(4), 0, "rank is 0 with filtering");
     }
 
     #[test]

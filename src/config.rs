@@ -19,6 +19,8 @@ pub struct Config {
     pub lua: LuaConfig,
     #[serde(default)]
     pub db: DbConfig,
+    #[serde(default)]
+    pub stdin: StdinConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -77,6 +79,49 @@ impl Default for DbConfig {
     fn default() -> Self {
         Self {
             max_rows: default_db_max_rows(),
+        }
+    }
+}
+
+/// Controls how stdin data is handled. Stdin cannot be seeked, so lr must
+/// either spill it to a temp file (enabling full random access) or keep it
+/// in a bounded ring buffer (discarding old data).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StdinConfig {
+    /// Strategy for handling stdin data:
+    /// - "temp-file" (default): spill stdin to a temp file, then use the
+    ///   same file-backed LineStore as regular files. Full random access.
+    /// - "memory": keep stdin in a bounded in-memory ring buffer. Old data
+    ///   is discarded when the buffer exceeds `memory_limit_mb`.
+    #[serde(default = "default_stdin_mode")]
+    pub mode: StdinMode,
+
+    /// Memory limit in MB for the "memory" mode ring buffer.
+    /// Ignored in "temp-file" mode. Default: 1024 (1 GB).
+    #[serde(default = "default_stdin_memory_limit_mb")]
+    pub memory_limit_mb: usize,
+}
+
+fn default_stdin_mode() -> StdinMode {
+    StdinMode::TempFile
+}
+
+fn default_stdin_memory_limit_mb() -> usize {
+    1024
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StdinMode {
+    TempFile,
+    Memory,
+}
+
+impl Default for StdinConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_stdin_mode(),
+            memory_limit_mb: default_stdin_memory_limit_mb(),
         }
     }
 }

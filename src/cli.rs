@@ -58,6 +58,25 @@ pub struct Cli {
     /// Print the effective config and exit (for debugging setup).
     #[arg(long)]
     print_config: bool,
+
+    /// Stdin handling strategy: "temp-file" (default) spills stdin to a
+    /// temp file for full random access. "memory" keeps stdin in a bounded
+    /// ring buffer, discarding old data beyond the memory limit.
+    #[arg(long, value_name = "MODE", value_enum)]
+    stdin_mode: Option<StdinModeArg>,
+
+    /// Memory limit in MB for stdin ring buffer mode (default: 1024).
+    /// Ignored when --stdin-mode=temp-file.
+    #[arg(long, value_name = "MB")]
+    stdin_memory_limit_mb: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum StdinModeArg {
+    /// Spill stdin to a temp file (default).
+    TempFile,
+    /// Keep stdin in a bounded in-memory ring buffer.
+    Memory,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -162,6 +181,19 @@ impl Cli {
     /// This is when --repl is given, --listen is given, or stdout is not a TTY.
     pub fn should_use_repl_mode(&self) -> bool {
         self.repl || self.listen.is_some() || !std::io::stdout().is_terminal()
+    }
+
+    /// Stdin mode override from CLI (None = use config default).
+    pub fn stdin_mode(&self) -> Option<crate::config::StdinMode> {
+        self.stdin_mode.map(|m| match m {
+            StdinModeArg::TempFile => crate::config::StdinMode::TempFile,
+            StdinModeArg::Memory => crate::config::StdinMode::Memory,
+        })
+    }
+
+    /// Stdin memory limit override from CLI (None = use config default).
+    pub fn stdin_memory_limit_mb(&self) -> Option<usize> {
+        self.stdin_memory_limit_mb
     }
 }
 
