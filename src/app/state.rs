@@ -330,17 +330,139 @@ impl AppState {
     pub fn set_filter(&mut self, filter: Filter) {
         self.filter = Some(filter);
         self.message = "filter applied".to_string();
+        self.clamp_cursor();
+        self.ensure_cursor_visible();
     }
 
     /// Clear the current filter.
     pub fn clear_filter(&mut self) {
         self.filter = None;
         self.message = "filter cleared".to_string();
+        self.clamp_cursor();
     }
 
     /// Check if a line passes the current filter (or if no filter is active).
     pub fn passes_filter(&self, line: &ParsedLine) -> bool {
         self.filter.as_ref().is_none_or(|f| f.matches(line))
+    }
+
+    /// Check if a line at `idx` is visible (passes both severity visibility
+    /// and filter).
+    fn is_line_visible(&self, idx: usize) -> bool {
+        if idx >= self.lines.len() {
+            return false;
+        }
+        let pl = &self.lines[idx];
+        if let Some(sev) = pl.severity
+            && !self.severity_visible.is_visible(sev)
+        {
+            return false;
+        }
+        self.passes_filter(pl)
+    }
+
+    /// True when any filtering is active (severity toggles or filter expr).
+    pub fn filtering_active(&self) -> bool {
+        self.filter.is_some()
+            || !self.severity_visible.error
+            || !self.severity_visible.warn
+            || !self.severity_visible.info
+            || !self.severity_visible.debug
+            || !self.severity_visible.trace
+    }
+
+    /// Find the next visible line at or after `idx`. Returns None if there
+    /// are no visible lines at or after `idx`.
+    fn next_visible_from(&self, idx: usize) -> Option<usize> {
+        let mut i = idx;
+        while i < self.lines.len() {
+            if self.is_line_visible(i) {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Find the previous visible line at or before `idx`. Returns None if
+    /// there are no visible lines at or before `idx`.
+    pub fn prev_visible_from(&self, idx: usize) -> Option<usize> {
+        if idx >= self.lines.len() {
+            return None;
+        }
+        let mut i = (idx + 1).min(self.lines.len());
+        while i > 0 {
+            i -= 1;
+            if self.is_line_visible(i) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Count the total number of visible lines.
+    pub fn visible_count(&self) -> usize {
+        self.lines.iter().filter(|pl| {
+            if let Some(sev) = pl.severity
+                && !self.severity_visible.is_visible(sev)
+            {
+                return false;
+            }
+            self.passes_filter(pl)
+        }).count()
+    }
+
+    /// Return the rank (0-based) of the line at `idx` among all visible
+    /// lines. Returns 0 if the line itself is not visible.
+    pub fn visible_rank(&self, idx: usize) -> usize {
+        let mut rank = 0;
+        for i in 0..=idx.min(self.lines.len().saturating_sub(1)) {
+            if self.is_line_visible(i) {
+                if i == idx {
+                    return rank;
+                }
+                rank += 1;
+            }
+        }
+        rank
+    }
+
+    /// Walk forward from `idx`, counting visible lines, and return the
+    /// index of the n-th visible line after `idx` (not counting `idx` itself).
+    /// Returns the last visible line if we run out.
+    fn nth_visible_after(&self, idx: usize, n: usize) -> usize {
+        let mut count = 0;
+        let mut pos = idx;
+        while pos < self.lines.len().saturating_sub(1) {
+            pos += 1;
+            if self.is_line_visible(pos) {
+                count += 1;
+                if count >= n {
+                    return pos;
+                }
+            }
+        }
+        // Return the last visible line (or idx if none found).
+        self.prev_visible_from(self.lines.len().saturating_sub(1)).unwrap_or(idx)
+    }
+
+    /// Walk backward from `idx`, counting visible lines, and return the
+    /// index of the n-th visible line before `idx` (not counting `idx` itself).
+    /// Returns the first visible line if we run out.
+    fn nth_visible_before(&self, idx: usize, n: usize) -> usize {
+        let mut count = 0;
+        let mut pos = idx;
+        while pos > 0 {
+            pos -= 1;
+            if self.is_line_visible(pos) {
+                count += 1;
+                if count >= n {
+                    return pos;
+                }
+            }
+        }
+        // Return the first visible line (or idx if none found).
+        self.next_visible_from(0).unwrap_or(idx)
     }
 
     /// Push a new parsed line and update stats.
@@ -357,12 +479,32 @@ impl AppState {
         (self.terminal_height as usize).saturating_sub(4).max(1)
     }
 
-    /// Maximum scroll offset that keeps the last line visible.
+    /// Maximum scroll offset that keeps the last visible line visible.
+    /// When filtering is active, this walks backwards from the end to find
+    /// the last page of visible lines.
     pub fn max_scroll(&self) -> usize {
-        self.lines.len().saturating_sub(self.visible_height())
+        if self.lines.is_empty() {
+            return 0;
+        }
+        if !self.filtering_active() {
+            return self.lines.len().saturating_sub(self.visible_height());
+        }
+        // Find the scroll position that puts the last visible line at the
+        // bottom of the view. Walk backwards from the end counting visible
+        // lines until we have visible_height of them.
+        let vh = self.visible_height();
+        let mut count = 0;
+        let mut pos = self.lines.len();
+        while pos > 0 && count < vh {
+            pos -= 1;
+            if self.is_line_visible(pos) {
+                count += 1;
+            }
+        }
+        pos
     }
 
-    /// Scroll to the bottom (last page).
+    /// Scroll to the bottom (last page of visible lines).
     pub fn scroll_to_bottom(&mut self) {
         self.scroll = self.max_scroll();
     }
@@ -375,31 +517,64 @@ impl AppState {
         }
     }
 
-    /// Clamp cursor to valid range.
-    fn clamp_cursor(&mut self) {
+    /// Clamp cursor to the nearest visible line. If no visible lines exist,
+    /// cursor stays at 0.
+    pub fn clamp_cursor(&mut self) {
         if self.lines.is_empty() {
             self.cursor = 0;
-        } else if self.cursor >= self.lines.len() {
+            return;
+        }
+        if self.cursor >= self.lines.len() {
             self.cursor = self.lines.len() - 1;
+        }
+        // If filtering is active, snap cursor to the nearest visible line.
+        if self.filtering_active() && !self.is_line_visible(self.cursor) {
+            // Try next visible, then prev visible.
+            if let Some(next) = self.next_visible_from(self.cursor) {
+                self.cursor = next;
+            } else if let Some(prev) = self.prev_visible_from(self.cursor) {
+                self.cursor = prev;
+            }
         }
     }
 
     /// Ensure the cursor is visible within the current scroll window.
-    /// If the cursor is above the visible area, scroll up to show it.
-    /// If below, scroll down to show it (preferring cursor at the bottom
-    /// of the view when scrolling down).
+    /// Computes the visible window by walking from `scroll` forward,
+    /// collecting visible lines. If the cursor is outside this window,
+    /// adjusts scroll to bring it into view.
     fn ensure_cursor_visible(&mut self) {
         if self.lines.is_empty() {
             return;
         }
         let vh = self.visible_height();
-        if self.cursor < self.scroll {
+
+        // Compute the first and last visible line indices in the current
+        // scroll window by walking from scroll forward.
+        let mut first_visible: Option<usize> = None;
+        let mut last_visible: Option<usize> = None;
+        let mut count = 0;
+        let mut idx = self.scroll;
+        while idx < self.lines.len() && count < vh {
+            if self.is_line_visible(idx) {
+                if first_visible.is_none() {
+                    first_visible = Some(idx);
+                }
+                last_visible = Some(idx);
+                count += 1;
+            }
+            idx += 1;
+        }
+
+        let first = first_visible.unwrap_or(self.scroll);
+        let last = last_visible.unwrap_or(self.scroll);
+
+        if self.cursor < first {
             // Cursor is above the visible area — scroll up to show it.
             self.scroll = self.cursor;
-        } else if self.cursor >= self.scroll + vh {
-            // Cursor is below the visible area — scroll down.
-            self.scroll = self.cursor.saturating_sub(vh - 1);
-            self.clamp_scroll();
+        } else if self.cursor > last {
+            // Cursor is below the visible area — scroll down so that the
+            // cursor is at the bottom of the view.
+            self.scroll = self.nth_visible_before(self.cursor, vh.saturating_sub(1));
         }
     }
 
@@ -431,43 +606,73 @@ impl AppState {
             AppAction::Quit => self.quit_requested = true,
             AppAction::Noop => {}
             AppAction::ScrollDown => {
-                // Move cursor down by one.
+                // Move cursor to the next visible line.
                 self.follow = false;
-                self.cursor = self.cursor.saturating_add(1);
-                self.clamp_cursor();
-                self.ensure_cursor_visible();
+                if self.filtering_active() {
+                    if let Some(next) = self.next_visible_from(self.cursor + 1) {
+                        self.cursor = next;
+                        self.ensure_cursor_visible();
+                    }
+                } else {
+                    self.cursor = self.cursor.saturating_add(1);
+                    self.clamp_cursor();
+                    self.ensure_cursor_visible();
+                }
             }
             AppAction::ScrollUp => {
-                // Move cursor up by one.
+                // Move cursor to the previous visible line.
                 self.follow = false;
-                self.cursor = self.cursor.saturating_sub(1);
-                self.ensure_cursor_visible();
+                if self.filtering_active() {
+                    if self.cursor > 0
+                        && let Some(prev) = self.prev_visible_from(self.cursor - 1)
+                    {
+                        self.cursor = prev;
+                        self.ensure_cursor_visible();
+                    }
+                } else {
+                    self.cursor = self.cursor.saturating_sub(1);
+                    self.ensure_cursor_visible();
+                }
             }
             AppAction::PageDown => {
-                // Move cursor down by one page. The cursor ends up at the
-                // first line of the next page (bottom of current view + 1).
+                // Move cursor down by one page of visible lines.
                 self.follow = false;
                 let vh = self.visible_height();
-                self.cursor = self.cursor.saturating_add(vh);
-                self.clamp_cursor();
-                self.ensure_cursor_visible();
+                if self.filtering_active() {
+                    self.cursor = self.nth_visible_after(self.cursor, vh);
+                    self.ensure_cursor_visible();
+                } else {
+                    self.cursor = self.cursor.saturating_add(vh);
+                    self.clamp_cursor();
+                    self.ensure_cursor_visible();
+                }
             }
             AppAction::PageUp => {
-                // Move cursor up by one page.
+                // Move cursor up by one page of visible lines.
                 self.follow = false;
                 let vh = self.visible_height();
-                self.cursor = self.cursor.saturating_sub(vh);
-                self.ensure_cursor_visible();
+                if self.filtering_active() {
+                    self.cursor = self.nth_visible_before(self.cursor, vh);
+                    self.ensure_cursor_visible();
+                } else {
+                    self.cursor = self.cursor.saturating_sub(vh);
+                    self.ensure_cursor_visible();
+                }
             }
             AppAction::Home => {
                 self.follow = false;
-                self.cursor = 0;
+                if self.filtering_active() {
+                    self.cursor = self.next_visible_from(0).unwrap_or(0);
+                } else {
+                    self.cursor = 0;
+                }
                 self.scroll = 0;
             }
             AppAction::End => {
                 self.follow = true;
-                self.clamp_cursor();
-                if !self.lines.is_empty() {
+                if self.filtering_active() {
+                    self.cursor = self.prev_visible_from(self.lines.len().saturating_sub(1)).unwrap_or(0);
+                } else if !self.lines.is_empty() {
                     self.cursor = self.lines.len() - 1;
                 }
                 self.scroll_to_bottom();
@@ -475,7 +680,9 @@ impl AppState {
             AppAction::ToggleFollow => {
                 self.follow = !self.follow;
                 if self.follow {
-                    if !self.lines.is_empty() {
+                    if self.filtering_active() {
+                        self.cursor = self.prev_visible_from(self.lines.len().saturating_sub(1)).unwrap_or(0);
+                    } else if !self.lines.is_empty() {
                         self.cursor = self.lines.len() - 1;
                     }
                     self.scroll_to_bottom();
@@ -490,11 +697,26 @@ impl AppState {
             AppAction::ToggleLineNumbers => {
                 self.show_line_numbers = !self.show_line_numbers;
             }
-            AppAction::ToggleSeverityError => self.severity_visible.error = !self.severity_visible.error,
-            AppAction::ToggleSeverityWarn => self.severity_visible.warn = !self.severity_visible.warn,
-            AppAction::ToggleSeverityInfo => self.severity_visible.info = !self.severity_visible.info,
-            AppAction::ToggleSeverityDebug => self.severity_visible.debug = !self.severity_visible.debug,
-            AppAction::ToggleSeverityTrace => self.severity_visible.trace = !self.severity_visible.trace,
+            AppAction::ToggleSeverityError => {
+                self.severity_visible.error = !self.severity_visible.error;
+                self.clamp_cursor();
+            }
+            AppAction::ToggleSeverityWarn => {
+                self.severity_visible.warn = !self.severity_visible.warn;
+                self.clamp_cursor();
+            }
+            AppAction::ToggleSeverityInfo => {
+                self.severity_visible.info = !self.severity_visible.info;
+                self.clamp_cursor();
+            }
+            AppAction::ToggleSeverityDebug => {
+                self.severity_visible.debug = !self.severity_visible.debug;
+                self.clamp_cursor();
+            }
+            AppAction::ToggleSeverityTrace => {
+                self.severity_visible.trace = !self.severity_visible.trace;
+                self.clamp_cursor();
+            }
             AppAction::Search => {
                 self.input_mode = InputMode::Search;
                 self.input_buffer.clear();
@@ -837,5 +1059,90 @@ mod tests {
         assert_eq!(stats.rate_history.len(), 1800);
         // Oldest sample should be 200, not 0
         assert_eq!(stats.rate_history[0], 200.0);
+    }
+
+    fn make_state_with_severity() -> AppState {
+        let mut s = AppState::new(Config::default(), Theme::default_theme(), vec![], false);
+        // Lines: error, info, error, info, error
+        let mut l0 = ParsedLine::stub("error one");
+        l0.severity = Some(Severity::Error);
+        let mut l1 = ParsedLine::stub("info one");
+        l1.severity = Some(Severity::Info);
+        let mut l2 = ParsedLine::stub("error two");
+        l2.severity = Some(Severity::Error);
+        let mut l3 = ParsedLine::stub("info two");
+        l3.severity = Some(Severity::Info);
+        let mut l4 = ParsedLine::stub("error three");
+        l4.severity = Some(Severity::Error);
+        s.push_line(l0);
+        s.push_line(l1);
+        s.push_line(l2);
+        s.push_line(l3);
+        s.push_line(l4);
+        s.terminal_height = 20;
+        s
+    }
+
+    #[test]
+    fn filter_navigation_skips_hidden_lines_down() {
+        let mut s = make_state_with_severity();
+        // Hide info lines — only errors visible (indices 0, 2, 4).
+        s.severity_visible.info = false;
+        s.cursor = 0; // on first error
+        s.apply(AppAction::ScrollDown);
+        assert_eq!(s.cursor, 2, "should skip to next visible (index 2)");
+        s.apply(AppAction::ScrollDown);
+        assert_eq!(s.cursor, 4, "should skip to next visible (index 4)");
+    }
+
+    #[test]
+    fn filter_navigation_skips_hidden_lines_up() {
+        let mut s = make_state_with_severity();
+        s.severity_visible.info = false;
+        s.cursor = 4; // on last error
+        s.apply(AppAction::ScrollUp);
+        assert_eq!(s.cursor, 2, "should skip to prev visible (index 2)");
+        s.apply(AppAction::ScrollUp);
+        assert_eq!(s.cursor, 0, "should skip to prev visible (index 0)");
+    }
+
+    #[test]
+    fn filter_home_end_go_to_visible_extremes() {
+        let mut s = make_state_with_severity();
+        s.severity_visible.info = false;
+        s.apply(AppAction::End);
+        assert_eq!(s.cursor, 4, "End should go to last visible line");
+        s.apply(AppAction::Home);
+        assert_eq!(s.cursor, 0, "Home should go to first visible line");
+    }
+
+    #[test]
+    fn filter_visible_count_and_rank() {
+        let mut s = make_state_with_severity();
+        s.severity_visible.info = false;
+        assert_eq!(s.visible_count(), 3, "3 error lines visible");
+        assert_eq!(s.visible_rank(0), 0, "index 0 is rank 0");
+        assert_eq!(s.visible_rank(2), 1, "index 2 is rank 1");
+        assert_eq!(s.visible_rank(4), 2, "index 4 is rank 2");
+    }
+
+    #[test]
+    fn filter_clamp_cursor_snaps_to_visible() {
+        let mut s = make_state_with_severity();
+        s.cursor = 1; // on an info line
+        s.severity_visible.info = false;
+        s.clamp_cursor();
+        // Should snap to next visible (index 2) or prev visible (index 0)
+        assert!(s.cursor == 0 || s.cursor == 2, "cursor should snap to visible line, got {}", s.cursor);
+    }
+
+    #[test]
+    fn no_filter_navigation_works_normally() {
+        let mut s = make_state_with_severity();
+        s.cursor = 0;
+        s.apply(AppAction::ScrollDown);
+        assert_eq!(s.cursor, 1, "without filter, cursor moves by 1");
+        s.apply(AppAction::ScrollDown);
+        assert_eq!(s.cursor, 2);
     }
 }

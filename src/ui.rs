@@ -326,7 +326,18 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
         };
         let current = cursor_line.line_no;
         if count_is_exact {
-            (format!("{}/{}", current, total), Color::White)
+            let base = format!("{}/{}", current, total);
+            if state.filtering_active() {
+                let vis = state.visible_count();
+                if vis == 0 {
+                    ("-- Nothing to display --".to_string(), Color::DarkGray)
+                } else {
+                    let rank = state.visible_rank(state.cursor.min(state.lines.len() - 1));
+                    (format!("{} {}/{} (filtered)", base, rank + 1, vis), Color::White)
+                }
+            } else {
+                (base, Color::White)
+            }
         } else {
             (format!("{}/{} (est!)", current, total), Color::Yellow)
         }
@@ -370,8 +381,15 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
         ));
     }
 
-    // Right side: sparkline + rate.
+    // Right side: growth rate text + sparkline.
+    let rate_str = if state.stats.lines_per_sec < 0.5 {
+        "-- File not growing --".to_string()
+    } else {
+        format!("Growth rate: {:.0} L/s", state.stats.lines_per_sec)
+    };
     let right_spans = vec![
+        Span::styled(rate_str, Style::default().fg(Color::Cyan)),
+        Span::raw(" "),
         Span::styled(sparkline, Style::default().fg(Color::Cyan)),
         Span::raw(" "),
     ];
