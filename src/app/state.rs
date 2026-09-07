@@ -166,6 +166,14 @@ pub struct AppState {
     // ── Database ──
     /// Shared in-memory SQLite database (set when DB writer is wired in).
     pub db: Option<crate::db::SharedDb>,
+
+    // ── Stdin temp-file spill ──
+    /// When stdin is spilled to a temp file, this holds the result once the
+    /// spill task completes. The main loop polls this and updates the store.
+    pub spill_result: Option<Arc<tokio::sync::Mutex<Option<crate::io::stdin::StdinSpillResult>>>>,
+
+    /// Path to the stdin temp file, for cleanup on exit.
+    pub spill_cleanup_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -233,12 +241,38 @@ impl AppState {
             search_cursor: 0,
             filter: None,
             db: None,
+            spill_result: None,
+            spill_cleanup_path: None,
         }
     }
 
     /// Replace the line store with the real one (file handle + index).
     pub fn set_store(&mut self, store: LineStore) {
         self.store = store;
+    }
+
+    /// Check if the stdin temp-file spill has completed. If so, update the
+    /// store with the temp file handle and return the temp file path (for
+    /// cleanup on exit). Returns None if the spill is not done yet.
+    pub fn try_apply_spill_result(&mut self) -> Option<std::path::PathBuf> {
+        let spill_result = self.spill_result.clone()?;
+        // Try to lock without blocking — if we can't, the spill task is
+        // still writing, so skip this round.
+        let mut guard = spill_result.try_lock().ok()?;
+        if let Some(result) = guard.take() {
+            tracing::info!(
+                "stdin spilled to {} ({} bytes)",
+                result.path.display(),
+                result.size
+            );
+            self.store.file = Some(result.file);
+            self.store.is_stdin = false;
+            self.spill_result = None; // Stop checking.
+            self.spill_cleanup_path = Some(result.path.clone());
+            Some(result.path)
+        } else {
+            None
+        }
     }
 
     /// Set the read progress tracker.

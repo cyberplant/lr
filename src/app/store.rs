@@ -40,7 +40,7 @@ pub struct LineStore {
     lru_order: VecDeque<usize>,
 
     /// File handle for on-demand reading.
-    file: Option<File>,
+    pub file: Option<File>,
 
     /// Source path (for parser).
     source: String,
@@ -49,7 +49,14 @@ pub struct LineStore {
     parser: Parser,
 
     /// Whether the store is for stdin (no file to seek back to).
-    is_stdin: bool,
+    pub is_stdin: bool,
+
+    /// Memory limit in bytes for ring buffer mode (0 = unlimited).
+    /// When set, tail_lines are evicted by total estimated memory.
+    memory_limit_bytes: usize,
+
+    /// Estimated total memory used by tail_lines (bytes).
+    tail_mem_bytes: usize,
 }
 
 impl LineStore {
@@ -69,7 +76,16 @@ impl LineStore {
             source,
             parser: Parser::new(),
             is_stdin,
+            memory_limit_bytes: 0,
+            tail_mem_bytes: 0,
         }
+    }
+
+    /// Set a memory limit for the ring buffer (bytes). When set, tail lines
+    /// are evicted by total estimated memory usage instead of just count.
+    pub fn set_memory_limit(&mut self, limit_bytes: usize) {
+        self.memory_limit_bytes = limit_bytes;
+        self.evict_to_limit();
     }
 
     /// Total number of lines (from the offset index + tail lines beyond index).
@@ -92,10 +108,27 @@ impl LineStore {
     /// The line's line_no is used to determine its 0-based index.
     pub fn push_tail(&mut self, line: ParsedLine) {
         let idx = (line.line_no as usize).saturating_sub(1);
+        // Estimate memory: raw text + source + fields overhead.
+        let est_bytes = estimate_line_bytes(&line);
         self.tail_lines.push_back((idx, line));
-        // Evict oldest tail line if over capacity.
+        self.tail_mem_bytes += est_bytes;
+        // Evict oldest if over count limit or memory limit.
+        self.evict_to_limit();
+    }
+
+    /// Evict oldest tail lines until under both count and memory limits.
+    fn evict_to_limit(&mut self) {
         while self.tail_lines.len() > MAX_TAIL_LINES {
-            self.tail_lines.pop_front();
+            if let Some((_, line)) = self.tail_lines.pop_front() {
+                self.tail_mem_bytes = self.tail_mem_bytes.saturating_sub(estimate_line_bytes(&line));
+            }
+        }
+        if self.memory_limit_bytes > 0 {
+            while self.tail_mem_bytes > self.memory_limit_bytes && self.tail_lines.len() > 1 {
+                if let Some((_, line)) = self.tail_lines.pop_front() {
+                    self.tail_mem_bytes = self.tail_mem_bytes.saturating_sub(estimate_line_bytes(&line));
+                }
+            }
         }
     }
 
@@ -255,6 +288,30 @@ impl LineStore {
     pub fn tail_start_offset(&self) -> Option<u64> {
         self.tail_lines.front().map(|(_, l)| l.byte_offset)
     }
+}
+
+/// Estimate the memory usage of a single ParsedLine in bytes.
+/// This is an approximation — it counts the raw text, source string,
+/// and field map overhead.
+fn estimate_line_bytes(line: &ParsedLine) -> usize {
+    let mut bytes = std::mem::size_of::<ParsedLine>();
+    bytes += line.raw.capacity();
+    bytes += line.source.capacity();
+    // HashMap overhead: ~48 bytes base + each entry ~80 bytes.
+    bytes += 48 + line.fields.len() * 80;
+    // Each field key string.
+    for (k, v) in &line.fields {
+        bytes += k.capacity();
+        bytes += match v {
+            crate::pipeline::parser::FieldValue::Str(s) => s.capacity(),
+            _ => 16,
+        };
+    }
+    // JSON value (if present).
+    if let Some(json) = &line.json {
+        bytes += serde_json::to_string(json).map(|s| s.capacity()).unwrap_or(0);
+    }
+    bytes
 }
 
 #[cfg(test)]

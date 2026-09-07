@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::io::file::open_dual;
 use crate::io::line_index::LineIndex;
 use crate::io::reader::head_reader;
-use crate::io::stdin::stdin_reader;
+use crate::io::stdin::{stdin_reader, stdin_to_temp_file, cleanup_temp_file, StdinSpillResult};
 use crate::io::tail::tail_reader_with_initial;
 use crate::io::RawLine;
 use crate::pipeline::index::ReadProgress;
@@ -84,10 +84,42 @@ pub async fn run(cli: Cli) -> Result<()> {
     // Create a shared LineIndex for the head reader and a LineStore for
     // on-demand line access. The head reader builds the index; the LineStore
     // uses it (plus a file handle) to read lines on demand.
-    let line_index = Arc::new(LineIndex::new(file_size));
     let is_stdin = cli.stdin() || cli.files().is_empty();
-    let store_file = if is_stdin {
+    let line_index = Arc::new(LineIndex::new(file_size));
+
+    // Determine stdin mode: CLI override takes priority, then config.
+    let stdin_mode = cli.stdin_mode().unwrap_or(state.config.stdin.mode);
+    let stdin_mem_limit_mb = cli
+        .stdin_memory_limit_mb()
+        .unwrap_or(state.config.stdin.memory_limit_mb);
+
+    // For stdin temp-file mode, we need to spawn the spilling task and
+    // get the temp file handle back before creating the LineStore.
+    // We use a channel to receive the spill result.
+    let stdin_spill_rx = if is_stdin && stdin_mode == crate::config::StdinMode::TempFile {
+        let (spill_tx, spill_rx) = tokio::sync::oneshot::channel::<StdinSpillResult>();
+        let spill_index = line_index.clone();
+        let spill_progress = progress.clone();
+        tokio::task::spawn_blocking(move || {
+            match stdin_to_temp_file(spill_index, spill_progress) {
+                Ok(result) => {
+                    let _ = spill_tx.send(result);
+                }
+                Err(e) => {
+                    tracing::error!("stdin temp file spill: {e:#}");
+                }
+            }
+        });
+        Some(spill_rx)
+    } else {
         None
+    };
+
+    // For file mode or stdin memory mode, create the store immediately.
+    // For stdin temp-file mode, the store will be set up after the spill
+    // completes (or we start with a placeholder and swap it).
+    let store_file = if is_stdin {
+        None // temp-file mode will set it later; memory mode doesn't need it.
     } else {
         cli.files().first().and_then(|p| std::fs::File::open(p).ok())
     };
@@ -96,12 +128,38 @@ pub async fn run(cli: Cli) -> Result<()> {
         .first()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "stdin".to_string());
-    let store = LineStore::new(line_index.clone(), store_file, store_source, is_stdin);
+
+    let mut store = LineStore::new(line_index.clone(), store_file, store_source, is_stdin);
+    if is_stdin && stdin_mode == crate::config::StdinMode::Memory {
+        store.set_memory_limit(stdin_mem_limit_mb * 1024 * 1024);
+    }
     state.set_store(store);
 
-    spawn_sources(&cli, raw_tx.clone(), progress.clone(), follow, line_index);
+    spawn_sources(&cli, raw_tx.clone(), progress.clone(), follow, line_index, is_stdin, stdin_mode);
     spawn_parser(raw_rx, parsed_tx, Some(db_tx));
 
+    // For stdin temp-file mode, spawn a task that waits for the spill to
+    // complete, then updates the store with the temp file handle. This
+    // allows the TUI/REPL to start immediately while stdin is being spilled.
+    if let Some(spill_rx) = stdin_spill_rx {
+        // We need to pass the store update to a background task.
+        // Since AppState is not Send, we can't move it into a task.
+        // Instead, we use a channel to send the spill result to the
+        // main loop, which polls it alongside parsed_rx.
+        // For simplicity, we spawn a tokio task that awaits the spill
+        // and stores the result in a shared cell that the main loop checks.
+        let spill_result = Arc::new(tokio::sync::Mutex::new(None));
+        let spill_result_clone = spill_result.clone();
+        tokio::spawn(async move {
+            if let Ok(result) = spill_rx.await {
+                *spill_result_clone.lock().await = Some(result);
+            }
+        });
+        // Store the shared cell on state so the main loop can check it.
+        state.spill_result = Some(spill_result);
+    }
+
+    // Run the app.
     if cli.should_use_repl_mode() {
         run_repl(cli, state, raw_tx, parsed_rx, progress).await
     } else {
@@ -129,6 +187,13 @@ async fn run_repl(
             let mut lines_this_sec: u64 = 0;
             let mut sec_start = Instant::now();
             loop {
+                // Check if stdin temp-file spill has completed.
+                {
+                    let mut s = state.lock().await;
+                    if s.spill_result.is_some() {
+                        s.try_apply_spill_result();
+                    }
+                }
                 let mut new_lines = 0u64;
                 while let Ok(line) = parsed_rx.try_recv() {
                     let mut s = state.lock().await;
@@ -216,6 +281,11 @@ async fn run_repl(
         tokio::signal::ctrl_c().await.ok();
     }
 
+    // Clean up stdin temp file if one was created.
+    if let Some(path) = state.lock().await.spill_cleanup_path.take() {
+        cleanup_temp_file(&path);
+    }
+
     Ok(())
 }
 
@@ -230,12 +300,14 @@ async fn run_repl(
 /// This means HOME shows the beginning immediately, END shows the last
 /// lines immediately, and both work in parallel. When the head reader
 /// reaches `tail_start`, the two views merge seamlessly.
-fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>, progress: ReadProgress, _follow: bool, line_index: Arc<LineIndex>) {
+fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>, progress: ReadProgress, _follow: bool, line_index: Arc<LineIndex>, _is_stdin: bool, stdin_mode: crate::config::StdinMode) {
     if cli.files().is_empty() && !cli.stdin() {
         return;
     }
 
-    if cli.stdin() {
+    // Stdin handling: in temp-file mode, the spill task is already spawned
+    // in run(). In memory mode, spawn the line-by-line reader.
+    if cli.stdin() && stdin_mode == crate::config::StdinMode::Memory {
         let tx = raw_tx.clone();
         tokio::task::spawn_blocking(move || {
             if let Err(e) = stdin_reader(tx) {
@@ -244,6 +316,7 @@ fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>, progress: ReadProgres
         });
     }
 
+    // For file mode, spawn head + tail readers as before.
     for (i, path) in cli.files().iter().enumerate() {
         let dual = match open_dual(path) {
             Ok(d) => d,
@@ -347,8 +420,13 @@ fn run_tui_loop(
     let mut last_render = Instant::now();
     let mut lines_this_sec: u64 = 0;
     let mut sec_start = Instant::now();
+    let mut spill_cleanup_path: Option<std::path::PathBuf> = None;
 
     loop {
+        // Check if stdin temp-file spill has completed.
+        if let Some(path) = state.try_apply_spill_result() {
+            spill_cleanup_path = Some(path);
+        }
         // Drain all available parsed lines into state.
         let mut new_lines = 0u64;
         while let Ok(line) = parsed_rx.try_recv() {
@@ -467,6 +545,10 @@ fn run_tui_loop(
                 break;
             }
         }
+    }
+    // Clean up stdin temp file if one was created.
+    if let Some(path) = spill_cleanup_path {
+        cleanup_temp_file(&path);
     }
     Ok(())
 }
