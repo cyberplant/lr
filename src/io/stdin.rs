@@ -54,12 +54,16 @@ fn best_temp_dir() -> PathBuf {
     std::env::temp_dir()
 }
 
+/// Monotonic counter for unique temp file names within a process.
+static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Create a temp file for stdin spilling. Returns the path and open handle.
 fn create_temp_file() -> Result<(PathBuf, File)> {
     let dir = best_temp_dir();
     let pid = std::process::id();
-    // Use a unique name to avoid collisions.
-    let path = dir.join(format!("lr-stdin-{pid}.log"));
+    let seq = TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Use a unique name to avoid collisions (PID + sequence + thread id).
+    let path = dir.join(format!("lr-stdin-{pid}-{seq}.log"));
     let file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
