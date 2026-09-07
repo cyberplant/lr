@@ -106,14 +106,14 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     render_command_bar(frame, state, chunks[2]);
 }
 
-fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
+fn render_log_view(frame: &mut Frame, state: &mut AppState, area: ratatui::layout::Rect) {
     let title = if state.files.is_empty() {
         "LR — (stdin)".to_string()
     } else {
         format!("LR — {}", state.files.first().map(|p| p.display().to_string()).unwrap_or_default())
     };
 
-    if state.lines.is_empty() {
+    if state.store.is_empty() {
         let view = Paragraph::new(vec![
             Line::from(Span::styled(
                 "LR — Log Reader",
@@ -143,15 +143,19 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
 
     let visible_height = state.visible_height();
     let scroll = state.scroll.min(state.max_scroll());
-    let cursor_idx = state.cursor.min(state.lines.len().saturating_sub(1));
+    let cursor_idx = state.cursor.min(state.store.len().saturating_sub(1));
     // Inner width of the log view (excluding left and right borders).
     let inner_width = area.width.saturating_sub(2) as usize;
 
     // Build visible lines, filtering by severity visibility and filter expr.
+    // Lines are read on demand from the store (store.get takes &mut self).
     let mut lines_rendered: Vec<Line> = Vec::with_capacity(visible_height);
     let mut idx = scroll;
-    while lines_rendered.len() < visible_height && idx < state.lines.len() {
-        let pl = &state.lines[idx];
+    while lines_rendered.len() < visible_height && idx < state.store.len() {
+        let pl = match state.store.get(idx) {
+            Some(pl) => pl,
+            None => { idx += 1; continue; }
+        };
         let is_cursor = idx == cursor_idx;
         idx += 1;
 
@@ -163,16 +167,19 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
         }
 
         // Skip lines that don't match the active filter.
-        if !state.passes_filter(pl) {
+        if !state.passes_filter(&pl) {
             continue;
         }
 
-        lines_rendered.push(render_line(pl, inner_width, state.show_line_numbers, state, is_cursor));
+        lines_rendered.push(render_line(&pl, inner_width, state.show_line_numbers, state, is_cursor));
     }
 
     // If we filtered out lines and haven't filled the view, keep going.
-    while lines_rendered.len() < visible_height && idx < state.lines.len() {
-        let pl = &state.lines[idx];
+    while lines_rendered.len() < visible_height && idx < state.store.len() {
+        let pl = match state.store.get(idx) {
+            Some(pl) => pl,
+            None => { idx += 1; continue; }
+        };
         let is_cursor = idx == cursor_idx;
         idx += 1;
         if let Some(sev) = pl.severity
@@ -180,10 +187,10 @@ fn render_log_view(frame: &mut Frame, state: &AppState, area: ratatui::layout::R
         {
             continue;
         }
-        if !state.passes_filter(pl) {
+        if !state.passes_filter(&pl) {
             continue;
         }
-        lines_rendered.push(render_line(pl, inner_width, state.show_line_numbers, state, is_cursor));
+        lines_rendered.push(render_line(&pl, inner_width, state.show_line_numbers, state, is_cursor));
     }
 
     let block = Block::default()
@@ -296,7 +303,7 @@ fn highlight_matches(text: &str, search: &crate::search::Search, base_color: Col
     spans
 }
 
-fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
+fn render_status_bar(frame: &mut Frame, state: &mut AppState, area: ratatui::layout::Rect) {
     let follow_indicator = if state.follow { "FOLLOW" } else { "  --  " };
 
     // File processing indicator: "Processing: X%" while head reader is
@@ -314,17 +321,18 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
     let count_is_exact = state.progress.head_done()
         || !state.progress.lines_estimated()
         || (state.progress.estimated_total_lines() > 0
-            && state.lines.len() as u64 >= state.progress.estimated_total_lines());
-    let (pos_str, pos_color) = if state.lines.is_empty() {
+            && state.store.len() as u64 >= state.progress.estimated_total_lines());
+    let (pos_str, pos_color) = if state.store.is_empty() {
         ("0/0".to_string(), Color::White)
     } else {
-        let cursor_line = &state.lines[state.cursor.min(state.lines.len() - 1)];
+        let cursor_idx = state.cursor.min(state.store.len() - 1);
+        let cursor_line = state.store.get(cursor_idx);
         let total = if count_is_exact {
-            state.lines.len() as u64
+            state.store.len() as u64
         } else {
             state.progress.estimated_total_lines()
         };
-        let current = cursor_line.line_no;
+        let current = cursor_line.as_ref().map(|l| l.line_no).unwrap_or(0);
         if count_is_exact {
             let base = format!("{}/{}", current, total);
             if state.filtering_active() {
@@ -332,7 +340,7 @@ fn render_status_bar(frame: &mut Frame, state: &AppState, area: ratatui::layout:
                 if vis == 0 {
                     ("-- Nothing to display --".to_string(), Color::DarkGray)
                 } else {
-                    let rank = state.visible_rank(state.cursor.min(state.lines.len() - 1));
+                    let rank = state.visible_rank(state.cursor.min(state.store.len() - 1));
                     (format!("{} {}/{} (filtered)", base, rank + 1, vis), Color::White)
                 }
             } else {

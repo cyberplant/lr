@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::io::file::open_dual;
+use crate::io::line_index::LineIndex;
 use crate::io::reader::head_reader;
 use crate::io::stdin::stdin_reader;
 use crate::io::tail::tail_reader_with_initial;
@@ -29,9 +30,11 @@ use crate::repl::dispatcher::OutputFormat;
 use crate::theme::Theme;
 use crate::app::events::{map_event, map_input_event, AppAction, InputAction};
 use crate::app::state::InputMode;
+use crate::app::store::LineStore;
 
 pub mod events;
 pub mod state;
+pub mod store;
 
 use state::AppState;
 
@@ -53,7 +56,10 @@ pub async fn run(cli: Cli) -> Result<()> {
     let follow = cli.follow();
     let mut state = AppState::new(config, theme, cli.files().to_vec(), follow);
 
-    // Set up the pipeline: readers → [raw_rx] → parser → [parsed_rx] → UI.
+    // Set up the pipeline: tail/stdin readers → [raw_rx] → parser → [parsed_rx] → UI.
+    // The head reader no longer sends lines through the parser — it builds
+    // a byte offset index (LineIndex) instead. Lines are read on demand
+    // from the file by the LineStore.
     let (raw_tx, raw_rx) = mpsc::channel::<RawLine>(CHANNEL_CAPACITY);
     let (parsed_tx, parsed_rx) = mpsc::channel::<ParsedLine>(CHANNEL_CAPACITY);
 
@@ -75,7 +81,25 @@ pub async fn run(cli: Cli) -> Result<()> {
     let (db_tx, db_rx) = mpsc::channel::<ParsedLine>(CHANNEL_CAPACITY);
     crate::db::spawn_db_writer(db, db_rx);
 
-    spawn_sources(&cli, raw_tx.clone(), progress.clone(), follow);
+    // Create a shared LineIndex for the head reader and a LineStore for
+    // on-demand line access. The head reader builds the index; the LineStore
+    // uses it (plus a file handle) to read lines on demand.
+    let line_index = Arc::new(LineIndex::new(file_size));
+    let is_stdin = cli.stdin() || cli.files().is_empty();
+    let store_file = if is_stdin {
+        None
+    } else {
+        cli.files().first().and_then(|p| std::fs::File::open(p).ok())
+    };
+    let store_source = cli
+        .files()
+        .first()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "stdin".to_string());
+    let store = LineStore::new(line_index.clone(), store_file, store_source, is_stdin);
+    state.set_store(store);
+
+    spawn_sources(&cli, raw_tx.clone(), progress.clone(), follow, line_index);
     spawn_parser(raw_rx, parsed_tx, Some(db_tx));
 
     if cli.should_use_repl_mode() {
@@ -108,39 +132,34 @@ async fn run_repl(
                 let mut new_lines = 0u64;
                 while let Ok(line) = parsed_rx.try_recv() {
                     let mut s = state.lock().await;
-                    s.push_line(line);
+                    s.push_tail_line(line);
                     new_lines += 1;
                 }
                 if new_lines > 0 {
                     lines_this_sec += new_lines;
-                    // Sort by byte offset to merge head and tail output.
                     // Save anchors for scroll and cursor restoration.
                     let mut s = state.lock().await;
-                    let (anchor_offset, cursor_offset) = if !s.follow && !s.lines.is_empty() {
-                        let scroll_idx = s.scroll.min(s.lines.len() - 1);
-                        let cursor_idx = s.cursor.min(s.lines.len() - 1);
-                        (Some(s.lines[scroll_idx].byte_offset), Some(s.lines[cursor_idx].byte_offset))
+                    let (anchor_offset, cursor_offset) = if !s.follow && !s.store.is_empty() {
+                        let scroll_idx = s.scroll.min(s.store.len() - 1);
+                        let cursor_idx = s.cursor.min(s.store.len() - 1);
+                        (s.store.offset(scroll_idx), s.store.offset(cursor_idx))
                     } else {
                         (None, None)
                     };
-                    s.lines.sort_by_key(|l| l.byte_offset);
-                    renumber_lines(&mut s);
                     if s.follow {
+                        let len = s.store.len();
                         if s.filtering_active() {
-                            s.cursor = s.prev_visible_from(s.lines.len().saturating_sub(1)).unwrap_or(0);
-                        } else if !s.lines.is_empty() {
-                            s.cursor = s.lines.len() - 1;
+                            s.cursor = s.prev_visible_from(len.saturating_sub(1)).unwrap_or(0);
+                        } else if len > 0 {
+                            s.cursor = len - 1;
                         }
                         s.scroll_to_bottom();
                     } else if let Some(anchor) = anchor_offset {
-                        let new_idx = s
-                            .lines
-                            .partition_point(|l| l.byte_offset < anchor);
+                        // Restore scroll to the line at the saved byte offset.
+                        let new_idx = s.store.line_at_offset(anchor);
                         s.scroll = new_idx.min(s.max_scroll());
                         if let Some(cursor_anchor) = cursor_offset {
-                            s.cursor = s
-                                .lines
-                                .partition_point(|l| l.byte_offset < cursor_anchor);
+                            s.cursor = s.store.line_at_offset(cursor_anchor);
                             s.clamp_cursor();
                         }
                     }
@@ -211,7 +230,7 @@ async fn run_repl(
 /// This means HOME shows the beginning immediately, END shows the last
 /// lines immediately, and both work in parallel. When the head reader
 /// reaches `tail_start`, the two views merge seamlessly.
-fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>, progress: ReadProgress, _follow: bool) {
+fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>, progress: ReadProgress, _follow: bool, line_index: Arc<LineIndex>) {
     if cli.files().is_empty() && !cli.stdin() {
         return;
     }
@@ -240,17 +259,23 @@ fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>, progress: ReadProgres
             progress.set_tail_start(tail_start);
         }
 
-        // Head reader: reads from byte 0 to tail_start (stops before tail's region).
-        let tx_head = raw_tx.clone();
-        let src_head = source.clone();
+        // Head reader: scans from byte 0 to tail_start, building the byte
+        // offset index. No longer sends lines through the parser pipeline.
         let head_file = dual.head;
         let head_progress = if i == 0 {
             progress.clone()
         } else {
             ReadProgress::new(size)
         };
+        // Only the first file shares the primary LineIndex; subsequent
+        // files get their own index (TODO: multi-file store support).
+        let head_index = if i == 0 {
+            line_index.clone()
+        } else {
+            Arc::new(LineIndex::new(size))
+        };
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = head_reader(head_file, tail_start, src_head, tx_head, head_progress) {
+            if let Err(e) = head_reader(head_file, tail_start, head_index, head_progress) {
                 tracing::error!("head reader: {e:#}");
             }
         });
@@ -283,82 +308,6 @@ fn spawn_sources(cli: &Cli, raw_tx: mpsc::Sender<RawLine>, progress: ReadProgres
 
     // Drop our own sender so the channel closes when all readers finish.
     drop(raw_tx);
-}
-
-/// Renumber lines after sorting by byte_offset.
-///
-/// Three cases:
-/// 1. Head done: number all lines sequentially 1..N (sort gives correct order).
-/// 2. Tail only (no head lines): start from estimated_total - N + 1.
-/// 3. Both head and tail lines, head not done: number head lines 1..head_count,
-///    tail lines from estimated_total - tail_count + 1. There's a gap between
-///    them, which is fine — binary search handles it.
-fn renumber_lines(state: &mut AppState) {
-    if state.lines.is_empty() {
-        return;
-    }
-
-    let head_done = state.progress.head_done();
-    let tail_start = state.progress.tail_start();
-
-    if head_done {
-        // Head is done — number everything sequentially.
-        for (i, line) in state.lines.iter_mut().enumerate() {
-            line.line_no = (i + 1) as u64;
-        }
-        return;
-    }
-
-    // Count head and tail lines.
-    let mut head_count = 0u64;
-    let mut tail_count = 0u64;
-    for line in &state.lines {
-        if line.byte_offset < tail_start {
-            head_count += 1;
-        } else {
-            tail_count += 1;
-        }
-    }
-
-    if tail_count == 0 {
-        // Only head lines — number sequentially.
-        for (i, line) in state.lines.iter_mut().enumerate() {
-            line.line_no = (i + 1) as u64;
-        }
-    } else if head_count == 0 {
-        // Only tail lines — start from estimated total.
-        let n = state.lines.len() as u64;
-        let estimated = state.progress.estimated_total_lines();
-        let start = if estimated > n {
-            estimated - n + 1
-        } else {
-            1
-        };
-        for (i, line) in state.lines.iter_mut().enumerate() {
-            line.line_no = start + i as u64;
-        }
-    } else {
-        // Both head and tail lines, head not done.
-        // Head lines: 1, 2, ..., head_count
-        // Tail lines: estimated_total - tail_count + 1, ..., estimated_total
-        let estimated = state.progress.estimated_total_lines();
-        let tail_start_no = if estimated > tail_count {
-            estimated - tail_count + 1
-        } else {
-            head_count + 1
-        };
-        let mut head_no = 1u64;
-        let mut tail_no = tail_start_no;
-        for line in state.lines.iter_mut() {
-            if line.byte_offset < tail_start {
-                line.line_no = head_no;
-                head_no += 1;
-            } else {
-                line.line_no = tail_no;
-                tail_no += 1;
-            }
-        }
-    }
 }
 
 /// Spawn the parser task that transforms raw lines into parsed lines.
@@ -403,7 +352,7 @@ fn run_tui_loop(
         // Drain all available parsed lines into state.
         let mut new_lines = 0u64;
         while let Ok(line) = parsed_rx.try_recv() {
-            state.push_line(line);
+            state.push_tail_line(line);
             new_lines += 1;
         }
         if new_lines > 0 {
@@ -412,38 +361,31 @@ fn run_tui_loop(
             // line so we can restore their positions after sorting (head
             // reader may insert lines before the current position, shifting
             // indices).
-            let (anchor_offset, cursor_offset) = if !state.follow && !state.lines.is_empty() {
-                let scroll_idx = state.scroll.min(state.lines.len() - 1);
-                let cursor_idx = state.cursor.min(state.lines.len() - 1);
-                (Some(state.lines[scroll_idx].byte_offset), Some(state.lines[cursor_idx].byte_offset))
+            let (anchor_offset, cursor_offset) = if !state.follow && !state.store.is_empty() {
+                let scroll_idx = state.scroll.min(state.store.len() - 1);
+                let cursor_idx = state.cursor.min(state.store.len() - 1);
+                (state.store.offset(scroll_idx), state.store.offset(cursor_idx))
             } else {
                 (None, None)
             };
-            // Sort lines by byte offset to merge head and tail reader output.
-            state.lines.sort_by_key(|l| l.byte_offset);
-            // Renumber lines.
-            renumber_lines(state);
             if state.follow {
                 // If following, snap cursor and scroll to the bottom.
                 // When filtering is active, snap to the last visible line
                 // (not the last raw line, which may be hidden).
+                let len = state.store.len();
                 if state.filtering_active() {
-                    state.cursor = state.prev_visible_from(state.lines.len().saturating_sub(1)).unwrap_or(0);
-                } else if !state.lines.is_empty() {
-                    state.cursor = state.lines.len() - 1;
+                    state.cursor = state.prev_visible_from(len.saturating_sub(1)).unwrap_or(0);
+                } else if len > 0 {
+                    state.cursor = len - 1;
                 }
                 state.scroll_to_bottom();
             } else if let Some(anchor) = anchor_offset {
                 // Restore scroll to the same line (by byte_offset).
-                let new_idx = state
-                    .lines
-                    .partition_point(|l| l.byte_offset < anchor);
+                let new_idx = state.store.line_at_offset(anchor);
                 state.scroll = new_idx.min(state.max_scroll());
                 // Restore cursor to the same line (by byte_offset).
                 if let Some(cursor_anchor) = cursor_offset {
-                    state.cursor = state
-                        .lines
-                        .partition_point(|l| l.byte_offset < cursor_anchor);
+                    state.cursor = state.store.line_at_offset(cursor_anchor);
                     // Clamp cursor in case of edge cases.
                     state.clamp_cursor();
                 }

@@ -1,7 +1,9 @@
-//! File and stream I/O: dual-FD open, head/tail/stdin readers, line buffer.
+//! File and stream I/O: dual-FD open, head/tail/stdin readers, line buffer,
+//! line offset index.
 
 pub mod file;
 pub mod line_buffer;
+pub mod line_index;
 pub mod line_splitter;
 pub mod reader;
 pub mod stdin;

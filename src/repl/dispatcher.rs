@@ -9,7 +9,9 @@ use tokio::sync::Mutex;
 
 use crate::app::events::AppAction;
 use crate::app::state::AppState;
+use crate::app::store::LineStore;
 use crate::io::file::open_dual;
+use crate::io::line_index::LineIndex;
 use crate::io::reader::head_reader;
 use crate::io::tail::tail_reader_with_initial;
 use crate::io::RawLine;
@@ -82,12 +84,19 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
                     // Update the progress tracker for this new file.
                     repl.progress.update_file_size(size);
                     repl.progress.set_tail_start(tail_start);
-                    let tx = repl.raw_tx.clone();
-                    let src = source.clone();
+                    // Create a LineIndex for the head reader and a LineStore
+                    // for on-demand line access.
+                    let line_index = Arc::new(LineIndex::new(size));
+                    let store_file = std::fs::File::open(&path).ok();
+                    let store = LineStore::new(line_index.clone(), store_file, source.clone(), false);
+                    let mut state = repl.state.lock().await;
+                    state.set_store(store);
+                    drop(state);
                     let head_file = dual.head;
                     let p = repl.progress.clone();
+                    let idx = line_index.clone();
                     tokio::task::spawn_blocking(move || {
-                        if let Err(e) = head_reader(head_file, tail_start, src, tx, p) {
+                        if let Err(e) = head_reader(head_file, tail_start, idx, p) {
                             tracing::error!("head reader: {e:#}");
                         }
                     });
@@ -115,8 +124,8 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
             }
         }
         Command::Show { plain } => {
-            let state = repl.state.lock().await;
-            DispatchResult::ok(render_viewport(&state, plain))
+            let mut state = repl.state.lock().await;
+            DispatchResult::ok(render_viewport(&mut state, plain))
         }
         Command::Goto { line } => {
             let mut state = repl.state.lock().await;
@@ -145,7 +154,8 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
         Command::End => {
             let mut state = repl.state.lock().await;
             state.apply(AppAction::End);
-            let last_line = state.lines.last().map(|l| l.line_no).unwrap_or(0);
+            let idx = state.store.len().saturating_sub(1);
+            let last_line = state.store.get(idx).map(|l| l.line_no).unwrap_or(0);
             DispatchResult::ok(format!("at end (line {})\n", last_line))
         }
         Command::Follow { on } => {
@@ -248,21 +258,21 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
             }
         }
         Command::Stats => {
-            let state = repl.state.lock().await;
+            let mut state = repl.state.lock().await;
             let count_is_exact = state.progress.head_done()
                 || !state.progress.lines_estimated()
                 || (state.progress.estimated_total_lines() > 0
-                    && state.lines.len() as u64 >= state.progress.estimated_total_lines());
+                    && state.store.len() as u64 >= state.progress.estimated_total_lines());
             let total = if count_is_exact {
-                state.lines.len() as u64
+                state.store.len() as u64
             } else {
                 state.progress.estimated_total_lines()
             };
-            let current_line = if state.lines.is_empty() {
+            let current_line = if state.store.is_empty() {
                 0
             } else {
-                let idx = state.cursor.min(state.lines.len() - 1);
-                state.lines[idx].line_no
+                let idx = state.cursor.min(state.store.len() - 1);
+                state.store.get(idx).map(|l| l.line_no).unwrap_or(0)
             };
             let est_suffix = if count_is_exact { "" } else { " (est!)" };
             DispatchResult::ok(format!(
@@ -277,16 +287,16 @@ async fn dispatch_text(cmd: Command, repl: &ReplState) -> DispatchResult {
             ))
         }
         Command::Lines { from, count } => {
-            let state = repl.state.lock().await;
-            DispatchResult::ok(render_lines(&state, from, count, false))
+            let mut state = repl.state.lock().await;
+            DispatchResult::ok(render_lines(&mut state, from, count, false))
         }
         Command::Fields { line } => {
-            let state = repl.state.lock().await;
-            render_fields(&state, line)
+            let mut state = repl.state.lock().await;
+            render_fields(&mut state, line)
         }
         Command::Json { line } => {
-            let state = repl.state.lock().await;
-            render_json(&state, line)
+            let mut state = repl.state.lock().await;
+            render_json(&mut state, line)
         }
         Command::ReadFile { mode } => {
             readfile(mode, repl).await
@@ -319,12 +329,19 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
                     let tail_start = dual.tail_start;
                     repl.progress.update_file_size(size);
                     repl.progress.set_tail_start(tail_start);
-                    let tx = repl.raw_tx.clone();
-                    let src = source.clone();
+                    // Create a LineIndex for the head reader and a LineStore
+                    // for on-demand line access.
+                    let line_index = Arc::new(LineIndex::new(size));
+                    let store_file = std::fs::File::open(&p_path).ok();
+                    let store = LineStore::new(line_index.clone(), store_file, source.clone(), false);
+                    let mut state = repl.state.lock().await;
+                    state.set_store(store);
+                    drop(state);
                     let head_file = dual.head;
                     let p = repl.progress.clone();
+                    let idx = line_index.clone();
                     tokio::task::spawn_blocking(move || {
-                        if let Err(e) = head_reader(head_file, tail_start, src, tx, p) {
+                        if let Err(e) = head_reader(head_file, tail_start, idx, p) {
                             tracing::error!("head reader: {e:#}");
                         }
                     });
@@ -356,8 +373,8 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
             }
         }
         Command::Show { plain: _ } => {
-            let state = repl.state.lock().await;
-            let lines: Vec<serde_json::Value> = visible_lines(&state)
+            let mut state = repl.state.lock().await;
+            let lines: Vec<serde_json::Value> = visible_lines(&mut state)
                 .into_iter()
                 .map(|(no, sev, raw)| {
                     serde_json::json!({
@@ -371,7 +388,7 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
                 serde_json::json!({
                     "ok": true,
                     "scroll": state.scroll,
-                    "total": state.lines.len(),
+                    "total": state.store.len(),
                     "follow": state.follow,
                     "lines": lines,
                 })
@@ -379,21 +396,21 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
             )
         }
         Command::Stats => {
-            let state = repl.state.lock().await;
+            let mut state = repl.state.lock().await;
             let count_is_exact = state.progress.head_done()
                 || !state.progress.lines_estimated()
                 || (state.progress.estimated_total_lines() > 0
-                    && state.lines.len() as u64 >= state.progress.estimated_total_lines());
+                    && state.store.len() as u64 >= state.progress.estimated_total_lines());
             let total = if count_is_exact {
-                state.lines.len() as u64
+                state.store.len() as u64
             } else {
                 state.progress.estimated_total_lines()
             };
-            let current_line = if state.lines.is_empty() {
+            let current_line = if state.store.is_empty() {
                 0
             } else {
-                let idx = state.cursor.min(state.lines.len() - 1);
-                state.lines[idx].line_no
+                let idx = state.cursor.min(state.store.len() - 1);
+                state.store.get(idx).map(|l| l.line_no).unwrap_or(0)
             };
             DispatchResult::ok(
                 serde_json::json!({
@@ -472,11 +489,11 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
             DispatchResult::ok(r#"{"ok":true}"#.into())
         }
         Command::Lines { from, count } => {
-            let state = repl.state.lock().await;
+            let mut state = repl.state.lock().await;
             let lines: Vec<serde_json::Value> = (from..from.saturating_add(count))
                 .filter_map(|i| {
                     let idx = (i as usize).saturating_sub(1);
-                    let pl = state.lines.get(idx)?;
+                    let pl = state.store.get(idx)?;
                     Some(serde_json::json!({
                         "no": pl.line_no,
                         "sev": severity_char(pl.severity),
@@ -487,9 +504,9 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
             DispatchResult::ok(serde_json::json!({"ok": true, "lines": lines}).to_string())
         }
         Command::Fields { line } => {
-            let state = repl.state.lock().await;
+            let mut state = repl.state.lock().await;
             let idx = line_to_index(&state, line);
-            match state.lines.get(idx) {
+            match state.store.get(idx) {
                 Some(pl) => {
                     let fields: serde_json::Value = pl
                         .fields
@@ -507,9 +524,9 @@ async fn dispatch_json(cmd: Command, repl: &ReplState) -> DispatchResult {
             }
         }
         Command::Json { line } => {
-            let state = repl.state.lock().await;
+            let mut state = repl.state.lock().await;
             let idx = line_to_index(&state, line);
-            match state.lines.get(idx).and_then(|pl| pl.json.as_ref()) {
+            match state.store.get(idx).and_then(|pl| pl.json.as_ref().cloned()) {
                 Some(v) => DispatchResult::ok(
                     serde_json::json!({"ok": true, "line": line, "json": v}).to_string(),
                 ),
@@ -622,7 +639,7 @@ async fn readfile(mode: ReadFileMode, repl: &ReplState) -> DispatchResult {
                     // read (estimated_total_lines is set) AND those lines
                     // have been drained into state.
                     let state = repl.state.lock().await;
-                    let has_tail_lines = state.lines.iter().any(|l| {
+                    let has_tail_lines = state.store.tail_lines_iter().any(|(_, l)| {
                         l.byte_offset >= progress.tail_start()
                     });
                     if (has_tail_lines && progress.estimated_total_lines() > 0)
@@ -685,7 +702,7 @@ async fn readfile_json(mode: ReadFileMode, repl: &ReplState) -> DispatchResult {
                 }
                 ReadFileMode::Quick => {
                     let state = repl.state.lock().await;
-                    let has_tail_lines = state.lines.iter().any(|l| {
+                    let has_tail_lines = state.store.tail_lines_iter().any(|(_, l)| {
                         l.byte_offset >= progress.tail_start()
                     });
                     if (has_tail_lines && progress.estimated_total_lines() > 0)
@@ -814,8 +831,8 @@ Commands:
 }
 
 /// Render the current viewport as text.
-fn render_viewport(state: &AppState, plain: bool) -> String {
-    if state.lines.is_empty() {
+fn render_viewport(state: &mut AppState, plain: bool) -> String {
+    if state.store.is_empty() {
         return "(no lines yet)\n".into();
     }
 
@@ -841,20 +858,23 @@ fn render_viewport(state: &AppState, plain: bool) -> String {
 }
 
 /// Return the visible lines as (line_no, severity_char, raw_text) tuples.
-fn visible_lines(state: &AppState) -> Vec<(u64, &'static str, String)> {
+fn visible_lines(state: &mut AppState) -> Vec<(u64, &'static str, String)> {
     let vh = state.visible_height();
     let scroll = state.scroll.min(state.max_scroll());
     let mut out = Vec::with_capacity(vh);
     let mut idx = scroll;
-    while out.len() < vh && idx < state.lines.len() {
-        let pl = &state.lines[idx];
+    while out.len() < vh && idx < state.store.len() {
+        let pl = match state.store.get(idx) {
+            Some(pl) => pl,
+            None => { idx += 1; continue; }
+        };
         idx += 1;
         if let Some(sev) = pl.severity
             && !state.severity_visible.is_visible(sev)
         {
             continue;
         }
-        if !state.passes_filter(pl) {
+        if !state.passes_filter(&pl) {
             continue;
         }
         out.push((pl.line_no, severity_char(pl.severity), pl.raw.clone()));
@@ -863,12 +883,12 @@ fn visible_lines(state: &AppState) -> Vec<(u64, &'static str, String)> {
 }
 
 /// Render specific lines by 1-based number.
-fn render_lines(state: &AppState, from: u64, count: u64, _plain: bool) -> String {
+fn render_lines(state: &mut AppState, from: u64, count: u64, _plain: bool) -> String {
     let mut out = String::new();
     let end = from.saturating_add(count);
     for i in from..end {
         let idx = line_to_index(state, i);
-        match state.lines.get(idx) {
+        match state.store.get(idx) {
             Some(pl) => {
                 out.push_str(&format!("{}\n", crate::ui::sanitize_for_terminal(&pl.raw)));
             }
@@ -878,9 +898,9 @@ fn render_lines(state: &AppState, from: u64, count: u64, _plain: bool) -> String
     out
 }
 
-fn render_fields(state: &AppState, line: u64) -> DispatchResult {
+fn render_fields(state: &mut AppState, line: u64) -> DispatchResult {
     let idx = line_to_index(state, line);
-    match state.lines.get(idx) {
+    match state.store.get(idx) {
         Some(pl) => {
             let mut out = format!("line {}:\n", line);
             let mut keys: Vec<_> = pl.fields.keys().collect();
@@ -902,24 +922,21 @@ fn render_fields(state: &AppState, line: u64) -> DispatchResult {
 }
 
 /// Convert a 1-based line number to a vector index.
-/// Uses binary search since line numbers are monotonically increasing
-/// after sorting by byte_offset (head lines 1..N, then tail lines
-/// estimated_start..estimated_total, with a gap between them).
+/// With the file-backed store, line numbers correspond directly to indices
+/// (1-based line_no → 0-based index). Clamps to the store length.
 fn line_to_index(state: &AppState, line: u64) -> usize {
-    if state.lines.is_empty() {
+    if state.store.is_empty() {
         return 0;
     }
-    // Binary search for the line with the matching line_no.
-    state
-        .lines
-        .partition_point(|pl| pl.line_no < line)
+    let idx = (line as usize).saturating_sub(1);
+    idx.min(state.store.len() - 1)
 }
 
-fn render_json(state: &AppState, line: u64) -> DispatchResult {
+fn render_json(state: &mut AppState, line: u64) -> DispatchResult {
     let idx = line_to_index(state, line);
-    match state.lines.get(idx).and_then(|pl| pl.json.as_ref()) {
+    match state.store.get(idx).and_then(|pl| pl.json.as_ref().cloned()) {
         Some(v) => {
-            let pretty = serde_json::to_string_pretty(v).unwrap_or_else(|e| format!("<error: {e}>"));
+            let pretty = serde_json::to_string_pretty(&v).unwrap_or_else(|e| format!("<error: {e}>"));
             DispatchResult::ok(format!("line {}:\n{}\n", line, pretty))
         }
         None => DispatchResult::ok(format!("error: line {} has no JSON\n", line)),
@@ -966,8 +983,9 @@ mod tests {
 
     fn make_state(lines: Vec<ParsedLine>) -> AppState {
         let mut s = AppState::new(Config::default(), Theme::default_theme(), vec![], false);
-        for l in lines {
-            s.push_line(l);
+        for (i, mut l) in lines.into_iter().enumerate() {
+            l.line_no = (i + 1) as u64;
+            s.push_tail_line(l);
         }
         s.terminal_height = 10;
         s
@@ -975,18 +993,18 @@ mod tests {
 
     #[test]
     fn render_viewport_empty() {
-        let s = make_state(vec![]);
-        let out = render_viewport(&s, true);
+        let mut s = make_state(vec![]);
+        let out = render_viewport(&mut s, true);
         assert!(out.contains("no lines"));
     }
 
     #[test]
     fn render_viewport_with_lines() {
-        let s = make_state(vec![
+        let mut s = make_state(vec![
             ParsedLine::stub("hello"),
             ParsedLine::stub("world"),
         ]);
-        let out = render_viewport(&s, true);
+        let out = render_viewport(&mut s, true);
         assert!(out.contains("hello"));
         assert!(out.contains("world"));
     }
